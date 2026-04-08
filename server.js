@@ -4,8 +4,6 @@ require("dotenv").config();
 
 const express = require("express");
 const path = require("node:path");
-const dns = require("node:dns");
-const { ProxyAgent } = require("undici");
 
 const app = express();
 const PORT = process.env.PORT || 5500;
@@ -14,8 +12,6 @@ const tasks = [];
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
-
-dns.setDefaultResultOrder("ipv4first");
 
 function clearTasks() {
   tasks.length = 0;
@@ -35,12 +31,19 @@ function buildDebugPayload(payload) {
 }
 
 function extractJsonPayload(text) {
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error("Claude response did not contain valid JSON.");
+  const raw = String(text || "").trim();
+  if (!raw) throw new Error("Claude response was empty.");
+
+  // Expect JSON-only per prompt contract. Keep a small fallback for fenced JSON.
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const fenced = raw.match(/```json\s*([\s\S]*?)\s*```/i) || raw.match(/```\s*([\s\S]*?)\s*```/);
+    if (fenced?.[1]) {
+      return JSON.parse(fenced[1].trim());
+    }
+    throw error;
   }
-  return JSON.parse(text.slice(firstBrace, lastBrace + 1));
 }
 
 function normalizeOperationListPayload(raw) {
@@ -76,21 +79,21 @@ function normalizeMessage(rawMessage) {
   return trimmed;
 }
 
-function normalizeTaskFields(raw) {
-  const title =
-    typeof raw.title === "string" && raw.title.trim() ? raw.title.trim() : "Untitled Task";
-  const urgencyRaw = Number(raw.urgency);
-  const durationRaw = Number(raw.duration);
-  const urgency = Number.isFinite(urgencyRaw)
-    ? Math.min(10, Math.max(1, Math.round(urgencyRaw)))
-    : 5;
-  const duration = Number.isFinite(durationRaw) ? Math.max(1, Math.round(durationRaw)) : 30;
+function normalizeTaskTitle(raw) {
+  const title = typeof raw === "string" ? raw.trim() : "";
+  return title || "Untitled Task";
+}
 
-  return {
-    title,
-    urgency,
-    duration
-  };
+function normalizeUrgency(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 5;
+  return Math.min(10, Math.max(1, Math.round(value)));
+}
+
+function normalizeDuration(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 30;
+  return Math.max(1, Math.round(value));
 }
 
 function parseOptionalUrgency(rawValue) {
@@ -156,29 +159,28 @@ function normalizeOperationPayload(raw) {
   const operation =
     operationRaw === "update" || operationRaw === "delete" ? operationRaw : "create";
   const targetTitle = typeof raw?.targetTitle === "string" ? raw.targetTitle.trim() : "";
-  const fields = normalizeTaskFields(raw || {});
+
+  if (operation === "create") {
+    return {
+      operation,
+      targetTitle: "",
+      fields: {
+        title: normalizeTaskTitle(raw?.title),
+        urgency: normalizeUrgency(raw?.urgency),
+        duration: normalizeDuration(raw?.duration)
+      }
+    };
+  }
+
   return {
     operation,
     targetTitle,
     fields: {
-      ...fields,
-      urgencyMaybe: parseOptionalUrgency(raw?.urgency),
-      durationMaybe: parseOptionalDuration(raw?.duration),
-      titleMaybe: typeof raw?.title === "string" ? raw.title.trim() : ""
+      title: typeof raw?.title === "string" ? raw.title.trim() : "",
+      urgency: parseOptionalUrgency(raw?.urgency),
+      duration: parseOptionalDuration(raw?.duration)
     }
   };
-}
-
-function getAnthropicDispatcher() {
-  const proxyUrl =
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy ||
-    process.env.ALL_PROXY ||
-    process.env.all_proxy;
-  if (!proxyUrl) return undefined;
-  return new ProxyAgent(proxyUrl);
 }
 
 app.post("/api/task", async (req, res) => {
@@ -204,6 +206,8 @@ app.post("/api/task", async (req, res) => {
       'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
       'If multiple changes happen, "message" should summarize them succinctly.',
       "",
+      "Important: output JSON only. No prose. No markdown. No code fences.",
+      "",
       `Current tasks: ${JSON.stringify(tasks)}`,
       `User request: ${query}`
     ].join("\n");
@@ -212,7 +216,6 @@ app.post("/api/task", async (req, res) => {
     try {
       claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        dispatcher: getAnthropicDispatcher(),
         headers: {
           "content-type": "application/json",
           "x-api-key": apiKey,
@@ -306,7 +309,7 @@ app.post("/api/task", async (req, res) => {
         continue;
       }
 
-      const targetIndex = findBestTaskIndex(op.targetTitle || op.fields.title);
+      const targetIndex = findBestTaskIndex(op.targetTitle);
       if (targetIndex === -1) {
         results.push({
           requested: op,
@@ -323,9 +326,9 @@ app.post("/api/task", async (req, res) => {
       if (op.operation === "update") {
         const task = {
           ...existing,
-          title: op.fields.titleMaybe || existing.title,
-          urgency: op.fields.urgencyMaybe ?? existing.urgency,
-          duration: op.fields.durationMaybe ?? existing.duration
+          title: op.fields.title || existing.title,
+          urgency: op.fields.urgency ?? existing.urgency,
+          duration: op.fields.duration ?? existing.duration
         };
         tasks[targetIndex] = task;
         results.push({ requested: op, applied: true, task });

@@ -30,7 +30,6 @@ document.addEventListener("DOMContentLoaded", () => {
     return;
   }
 
-  const messages = [];
   let latestJsonText = "";
 
   function nowIso() {
@@ -84,7 +83,6 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function pushMessage(message) {
-    messages.push(message);
     renderMessage(message);
   }
 
@@ -213,30 +211,23 @@ document.addEventListener("DOMContentLoaded", () => {
     handleSend();
   });
 
-  resetButton.addEventListener("click", async () => {
+  async function resetThread({ showFeedback } = { showFeedback: false }) {
     threadError.textContent = "";
     try {
       await clearTaskStorage();
-      messages.length = 0;
       thread.replaceChildren();
-      composerFeedback.textContent = "Reset complete.";
+      if (showFeedback) composerFeedback.textContent = "Reset complete.";
       setJsonOutput("");
     } catch (error) {
       threadError.textContent = error instanceof Error ? error.message : "Failed to reset.";
     }
-  });
+  }
+
+  resetButton.addEventListener("click", () => resetThread({ showFeedback: true }));
 
   // Requirement: reloading the page should clear persisted in-memory task state.
   window.addEventListener("load", async () => {
-    try {
-      await clearTaskStorage();
-      messages.length = 0;
-      thread.replaceChildren();
-      setJsonOutput("");
-    } catch (error) {
-      threadError.textContent =
-        error instanceof Error ? error.message : "Failed to reset tasks on load.";
-    }
+    await resetThread({ showFeedback: false });
   });
 
   jsonToggle.addEventListener("click", () => {
