@@ -1,7 +1,8 @@
 "use strict";
 
+require("dotenv").config();
+
 const express = require("express");
-const fs = require("node:fs/promises");
 const path = require("node:path");
 const dns = require("node:dns");
 const { ProxyAgent } = require("undici");
@@ -12,7 +13,7 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
 const tasks = [];
 
 app.use(express.json());
-app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, "public")));
 
 dns.setDefaultResultOrder("ipv4first");
 
@@ -20,13 +21,17 @@ function clearTasks() {
   tasks.length = 0;
 }
 
-async function readApiKey() {
-  const keyPath = path.join(__dirname, "api-key.txt");
-  const key = (await fs.readFile(keyPath, "utf8")).trim();
+function getApiKey() {
+  const key = String(process.env.ANTHROPIC_API_KEY || "").trim();
   if (!key) {
-    throw new Error("api-key.txt is empty");
+    throw new Error("Missing ANTHROPIC_API_KEY in environment.");
   }
   return key;
+}
+
+function buildDebugPayload(payload) {
+  const enabled = String(process.env.DEBUG || "").toLowerCase() === "true";
+  return enabled ? payload : undefined;
 }
 
 function extractJsonPayload(text) {
@@ -183,7 +188,7 @@ app.post("/api/task", async (req, res) => {
       return res.status(400).json({ error: "Query is required." });
     }
 
-    const apiKey = await readApiKey();
+    const apiKey = getApiKey();
     const prompt = [
       "You are a task operation parser.",
       "Given the user request and current task list, return JSON only with the shape:",
@@ -223,13 +228,13 @@ app.post("/api/task", async (req, res) => {
     } catch (error) {
       return res.status(502).json({
         error: "I couldn’t update your tasks right now.",
-        debug: {
+        debug: buildDebugPayload({
           type: "anthropic_fetch_failed",
           details:
             error instanceof Error
               ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
               : "Unknown fetch error"
-        }
+        })
       });
     }
 
@@ -237,11 +242,11 @@ app.post("/api/task", async (req, res) => {
       const errorText = await claudeResponse.text();
       return res.status(claudeResponse.status).json({
         error: "I couldn’t update your tasks right now.",
-        debug: {
+        debug: buildDebugPayload({
           type: "anthropic_api_error",
           status: claudeResponse.status,
           details: errorText.slice(0, 2000)
-        }
+        })
       });
     }
 
@@ -250,7 +255,7 @@ app.post("/api/task", async (req, res) => {
     if (!textChunk) {
       return res.status(502).json({
         error: "I couldn’t understand the assistant response.",
-        debug: { type: "anthropic_missing_text" }
+        debug: buildDebugPayload({ type: "anthropic_missing_text" })
       });
     }
 
@@ -260,13 +265,13 @@ app.post("/api/task", async (req, res) => {
     } catch (error) {
       return res.status(502).json({
         error: "I couldn’t understand the assistant response.",
-        debug: {
+        debug: buildDebugPayload({
           type: "anthropic_invalid_json",
           details:
             error instanceof Error
               ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
               : "Unknown JSON parse error"
-        }
+        })
       });
     }
 
@@ -276,13 +281,13 @@ app.post("/api/task", async (req, res) => {
     } catch (error) {
       return res.status(502).json({
         error: "I couldn’t understand the assistant response.",
-        debug: {
+        debug: buildDebugPayload({
           type: "anthropic_missing_operations",
           details:
             error instanceof Error
               ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
               : "Unknown operations parse error"
-        }
+        })
       });
     }
 
@@ -342,13 +347,13 @@ app.post("/api/task", async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       error: "I couldn’t update your tasks right now.",
-      debug: {
+      debug: buildDebugPayload({
         type: "server_error",
         details:
           error instanceof Error
             ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
             : "Unknown server error."
-      }
+      })
     });
   }
 });
