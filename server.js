@@ -1,21 +1,19 @@
 "use strict";
 
+/**
+ * Env (see .gitignore for .env):
+ * - ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (required for tasks)
+ * - CLAUDE_MODEL, DEBUG
+ * - TELEGRAM_BOT_TOKEN: required; server long-polls Telegram getUpdates for this bot.
+ */
+
 require("dotenv").config();
 
-const express = require("express");
-const path = require("node:path");
+const { createClient } = require("@supabase/supabase-js");
 
-const app = express();
-const PORT = process.env.PORT || 5500;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
-const tasks = [];
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-
-function clearTasks() {
-  tasks.length = 0;
-}
+const TELEGRAM_MAX_MESSAGE_LEN = 4096;
 
 function getApiKey() {
   const key = String(process.env.ANTHROPIC_API_KEY || "").trim();
@@ -25,9 +23,41 @@ function getApiKey() {
   return key;
 }
 
+function getSupabaseConfig() {
+  const url = String(process.env.SUPABASE_URL || "").trim();
+  const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  if (!url) throw new Error("Missing SUPABASE_URL in environment.");
+  if (!key) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY in environment.");
+  return { url, key };
+}
+
+const supabase = (() => {
+  const { url, key } = getSupabaseConfig();
+  return createClient(url, key);
+})();
+
 function buildDebugPayload(payload) {
   const enabled = String(process.env.DEBUG || "").toLowerCase() === "true";
   return enabled ? payload : undefined;
+}
+
+function httpTaskError(status, errorMessage, debugDetails) {
+  const err = new Error(errorMessage);
+  err.status = status;
+  err.body = { error: errorMessage, debug: buildDebugPayload(debugDetails) };
+  return err;
+}
+
+function getTelegramBotToken() {
+  return String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+}
+
+function isUuid(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    trimmed
+  );
 }
 
 function extractJsonPayload(text) {
@@ -110,60 +140,18 @@ function parseOptionalDuration(rawValue) {
   return Math.max(1, Math.round(value));
 }
 
-function normalizeTitle(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function scoreTitleMatch(candidateTitle, targetTitle) {
-  const candidate = normalizeTitle(candidateTitle);
-  const target = normalizeTitle(targetTitle);
-  if (!candidate || !target) return 0;
-  if (candidate === target) return 100;
-  if (candidate.includes(target) || target.includes(candidate)) return 75;
-
-  const candidateTokens = new Set(candidate.split(" "));
-  const targetTokens = target.split(" ");
-  const overlap = targetTokens.filter((token) => candidateTokens.has(token)).length;
-  return Math.round((overlap / targetTokens.length) * 60);
-}
-
-function findBestTaskIndex(targetTitle) {
-  if (!targetTitle || !tasks.length) return -1;
-
-  let bestIndex = -1;
-  let bestScore = 0;
-  let secondBestScore = 0;
-  tasks.forEach((task, idx) => {
-    const score = scoreTitleMatch(task.title, targetTitle);
-    if (score > bestScore) {
-      secondBestScore = bestScore;
-      bestScore = score;
-      bestIndex = idx;
-    } else if (score > secondBestScore) {
-      secondBestScore = score;
-    }
-  });
-
-  const confidentEnough = bestScore >= 50 && bestScore - secondBestScore >= 10;
-  return confidentEnough ? bestIndex : -1;
-}
-
 function normalizeOperationPayload(raw) {
   const operationRaw = String(raw?.operation || "")
     .trim()
     .toLowerCase();
   const operation =
     operationRaw === "update" || operationRaw === "delete" ? operationRaw : "create";
-  const targetTitle = typeof raw?.targetTitle === "string" ? raw.targetTitle.trim() : "";
+  const targetId = typeof raw?.targetId === "string" ? raw.targetId.trim() : "";
 
   if (operation === "create") {
     return {
       operation,
-      targetTitle: "",
+      targetId: null,
       fields: {
         title: normalizeTaskTitle(raw?.title),
         urgency: normalizeUrgency(raw?.urgency),
@@ -174,7 +162,7 @@ function normalizeOperationPayload(raw) {
 
   return {
     operation,
-    targetTitle,
+    targetId,
     fields: {
       title: typeof raw?.title === "string" ? raw.title.trim() : "",
       urgency: parseOptionalUrgency(raw?.urgency),
@@ -183,189 +171,386 @@ function normalizeOperationPayload(raw) {
   };
 }
 
-app.post("/api/task", async (req, res) => {
+async function listOpenTasks() {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("id,title,urgency,duration,status,created_at,updated_at")
+    .eq("status", "open")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    throw new Error(`Supabase list tasks failed: ${error.message}`);
+  }
+  return Array.isArray(data) ? data : [];
+}
+
+async function clearAllOpenTasks() {
+  const { error } = await supabase
+    .from("tasks")
+    .update({ status: "canceled", updated_at: new Date().toISOString() })
+    .eq("status", "open");
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const tasks = await listOpenTasks();
+  return { tasks };
+}
+
+async function processTaskQuery(query) {
+  const apiKey = getApiKey();
+  const currentTasks = await listOpenTasks();
+  const prompt = [
+    "You are a task operation parser.",
+    "Given the user request and current task list, return JSON only with the shape:",
+    '{ "operations": [ { operation, targetId, title, urgency, duration }, ... ], "message": "..." }',
+    'operation must be one of: "create" | "update" | "delete".',
+    "Return one operation per requested change. Multiple operations are allowed in one response.",
+    'Use operation "create" for new tasks, "update" for edits to existing tasks, and "delete" for cancel requests.',
+    "For update/delete, set targetId to the id of the existing task you want to change.",
+    "For create, targetId should be null or omitted.",
+    "For update/delete, targetId must be one of the ids from Current tasks.",
+    "Urgency must be 1-10, duration in minutes.",
+    "For update, title/urgency/duration are optional; omit or set null to keep the current value.",
+    "",
+    'Also include a user-facing "message" string that summarizes what you did in friendly natural language.',
+    'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
+    'If multiple changes happen, "message" should summarize them succinctly.',
+    "",
+    "Important: output JSON only. No prose. No markdown. No code fences.",
+    "",
+    `Current tasks: ${JSON.stringify(currentTasks)}`,
+    `User request: ${query}`
+  ].join("\n");
+
+  let claudeResponse;
   try {
-    const query = String(req.body?.query || "").trim();
-    if (!query) {
-      return res.status(400).json({ error: "Query is required." });
-    }
+    claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 300,
+        temperature: 0.2,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+  } catch (error) {
+    throw httpTaskError(502, "I couldn’t update your tasks right now.", {
+      type: "anthropic_fetch_failed",
+      details:
+        error instanceof Error
+          ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
+          : "Unknown fetch error"
+    });
+  }
 
-    const apiKey = getApiKey();
-    const prompt = [
-      "You are a task operation parser.",
-      "Given the user request and current task list, return JSON only with the shape:",
-      '{ "operations": [ { operation, targetTitle, title, urgency, duration }, ... ], "message": "..." }',
-      'operation must be one of: "create" | "update" | "delete".',
-      "Return one operation per requested change. Multiple operations are allowed in one response.",
-      'Use operation "create" for new tasks, "update" for edits to existing tasks, and "delete" for cancel requests.',
-      "For update/delete, set targetTitle to the best title phrase identifying the existing task.",
-      "For create, targetTitle should be empty.",
-      "Urgency must be 1-10, duration in minutes.",
-      "",
-      'Also include a user-facing "message" string that summarizes what you did in friendly natural language.',
-      'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
-      'If multiple changes happen, "message" should summarize them succinctly.',
-      "",
-      "Important: output JSON only. No prose. No markdown. No code fences.",
-      "",
-      `Current tasks: ${JSON.stringify(tasks)}`,
-      `User request: ${query}`
-    ].join("\n");
+  if (!claudeResponse.ok) {
+    const errorText = await claudeResponse.text();
+    throw httpTaskError(claudeResponse.status, "I couldn’t update your tasks right now.", {
+      type: "anthropic_api_error",
+      status: claudeResponse.status,
+      details: errorText.slice(0, 2000)
+    });
+  }
 
-    let claudeResponse;
-    try {
-      claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: CLAUDE_MODEL,
-          max_tokens: 300,
-          temperature: 0.2,
-          messages: [{ role: "user", content: prompt }]
-        })
-      });
-    } catch (error) {
-      return res.status(502).json({
-        error: "I couldn’t update your tasks right now.",
-        debug: buildDebugPayload({
-          type: "anthropic_fetch_failed",
-          details:
-            error instanceof Error
-              ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-              : "Unknown fetch error"
-        })
-      });
-    }
+  const data = await claudeResponse.json();
+  const textChunk = data?.content?.find((item) => item.type === "text")?.text;
+  if (!textChunk) {
+    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+      type: "anthropic_missing_text"
+    });
+  }
 
-    if (!claudeResponse.ok) {
-      const errorText = await claudeResponse.text();
-      return res.status(claudeResponse.status).json({
-        error: "I couldn’t update your tasks right now.",
-        debug: buildDebugPayload({
-          type: "anthropic_api_error",
-          status: claudeResponse.status,
-          details: errorText.slice(0, 2000)
-        })
-      });
-    }
+  let parsed;
+  try {
+    parsed = extractJsonPayload(textChunk);
+  } catch (error) {
+    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+      type: "anthropic_invalid_json",
+      details:
+        error instanceof Error
+          ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
+          : "Unknown JSON parse error"
+    });
+  }
 
-    const data = await claudeResponse.json();
-    const textChunk = data?.content?.find((item) => item.type === "text")?.text;
-    if (!textChunk) {
-      return res.status(502).json({
-        error: "I couldn’t understand the assistant response.",
-        debug: buildDebugPayload({ type: "anthropic_missing_text" })
-      });
-    }
+  let operations;
+  try {
+    operations = normalizeOperationListPayload(parsed);
+  } catch (error) {
+    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+      type: "anthropic_missing_operations",
+      details:
+        error instanceof Error
+          ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
+          : "Unknown operations parse error"
+    });
+  }
 
-    let parsed;
-    try {
-      parsed = extractJsonPayload(textChunk);
-    } catch (error) {
-      return res.status(502).json({
-        error: "I couldn’t understand the assistant response.",
-        debug: buildDebugPayload({
-          type: "anthropic_invalid_json",
-          details:
-            error instanceof Error
-              ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-              : "Unknown JSON parse error"
-        })
-      });
-    }
-
-    let operations;
-    try {
-      operations = normalizeOperationListPayload(parsed);
-    } catch (error) {
-      return res.status(502).json({
-        error: "I couldn’t understand the assistant response.",
-        debug: buildDebugPayload({
-          type: "anthropic_missing_operations",
-          details:
-            error instanceof Error
-              ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-              : "Unknown operations parse error"
-        })
-      });
-    }
-
-    const results = [];
-    for (const op of operations) {
-      if (op.operation === "create") {
-        const task = {
+  const results = [];
+  for (const op of operations) {
+    if (op.operation === "create") {
+      const { data: row, error } = await supabase
+        .from("tasks")
+        .insert({
           title: op.fields.title,
           urgency: op.fields.urgency,
           duration: op.fields.duration,
-          status: "open",
-          timeCreated: new Date().toISOString()
-        };
-        tasks.unshift(task);
-        results.push({ requested: op, applied: true, task });
+          status: "open"
+        })
+        .select("id,title,urgency,duration,status,created_at,updated_at")
+        .single();
+
+      if (error) {
+        results.push({ requested: op, applied: false, error: error.message });
         continue;
       }
 
-      const targetIndex = findBestTaskIndex(op.targetTitle);
-      if (targetIndex === -1) {
+      results.push({ requested: op, applied: true, task: row });
+      continue;
+    }
+
+    if (!isUuid(op.targetId)) {
+      results.push({
+        requested: op,
+        applied: false,
+        error:
+          op.operation === "update"
+            ? "Missing or invalid targetId for update."
+            : "Missing or invalid targetId for cancel."
+      });
+      continue;
+    }
+
+    if (op.operation === "update") {
+      const updatePayload = {};
+      if (op.fields.title) updatePayload.title = op.fields.title;
+      if (op.fields.urgency !== undefined) updatePayload.urgency = op.fields.urgency;
+      if (op.fields.duration !== undefined) updatePayload.duration = op.fields.duration;
+      updatePayload.updated_at = new Date().toISOString();
+
+      if (!Object.keys(updatePayload).length) {
         results.push({
           requested: op,
           applied: false,
-          error:
-            op.operation === "update"
-              ? "Could not confidently match a task to update."
-              : "Could not confidently match a task to cancel."
+          error: "No fields provided to update."
         });
         continue;
       }
 
-      const existing = tasks[targetIndex];
-      if (op.operation === "update") {
-        const task = {
-          ...existing,
-          title: op.fields.title || existing.title,
-          urgency: op.fields.urgency ?? existing.urgency,
-          duration: op.fields.duration ?? existing.duration
-        };
-        tasks[targetIndex] = task;
-        results.push({ requested: op, applied: true, task });
-      } else {
-        const task = { ...existing, status: "canceled" };
-        tasks[targetIndex] = task;
-        results.push({ requested: op, applied: true, task });
+      const { data: row, error } = await supabase
+        .from("tasks")
+        .update(updatePayload)
+        .eq("id", op.targetId)
+        .select("id,title,urgency,duration,status,created_at,updated_at")
+        .single();
+
+      if (error) {
+        results.push({ requested: op, applied: false, error: error.message });
+        continue;
+      }
+
+      results.push({ requested: op, applied: true, task: row });
+    } else {
+      const { data: row, error } = await supabase
+        .from("tasks")
+        .update({ status: "canceled", updated_at: new Date().toISOString() })
+        .eq("id", op.targetId)
+        .select("id,title,urgency,duration,status,created_at,updated_at")
+        .single();
+
+      if (error) {
+        results.push({ requested: op, applied: false, error: error.message });
+        continue;
+      }
+
+      results.push({ requested: op, applied: true, task: row });
+    }
+  }
+
+  const firstApplied = results.find((r) => r.applied);
+  const refreshedTasks = await listOpenTasks();
+  return {
+    message: normalizeMessage(parsed?.message) || buildFallbackMessageFromResults(results),
+    operations: results,
+    tasks: refreshedTasks,
+    operation: firstApplied?.requested?.operation,
+    task: firstApplied?.task
+  };
+}
+
+function splitTelegramText(text) {
+  const s = String(text || "");
+  if (s.length <= TELEGRAM_MAX_MESSAGE_LEN) return [s];
+
+  const chunks = [];
+  let start = 0;
+  while (start < s.length) {
+    const end = Math.min(start + TELEGRAM_MAX_MESSAGE_LEN, s.length);
+    let slice = s.slice(start, end);
+    if (end < s.length) {
+      const lastNl = slice.lastIndexOf("\n");
+      if (lastNl > TELEGRAM_MAX_MESSAGE_LEN * 0.6) {
+        slice = slice.slice(0, lastNl + 1);
       }
     }
+    chunks.push(slice);
+    start += slice.length;
+  }
+  return chunks;
+}
 
-    const firstApplied = results.find((r) => r.applied);
-    return res.json({
-      message: normalizeMessage(parsed?.message) || buildFallbackMessageFromResults(results),
-      operations: results,
-      tasks,
-      operation: firstApplied?.requested?.operation,
-      task: firstApplied?.task
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: "I couldn’t update your tasks right now.",
-      debug: buildDebugPayload({
-        type: "server_error",
-        details:
-          error instanceof Error
-            ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-            : "Unknown server error."
-      })
+async function telegramApi(method, body) {
+  const token = getTelegramBotToken();
+  if (!token) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN.");
+  }
+  const url = `https://api.telegram.org/bot${token}/${method}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) {
+    const desc = data.description || response.statusText || "Telegram API error";
+    throw new Error(desc);
+  }
+  return data;
+}
+
+async function telegramSendMessage(chatId, text) {
+  const parts = splitTelegramText(text);
+  for (const part of parts) {
+    await telegramApi("sendMessage", {
+      chat_id: chatId,
+      text: part
     });
   }
-});
+}
 
-app.post("/api/tasks/clear", (req, res) => {
-  clearTasks();
-  return res.json({ tasks });
-});
+function formatTaskListLine(task) {
+  const id = typeof task?.id === "string" ? task.id : "";
+  const shortId = id.length > 8 ? `${id.slice(0, 8)}…` : id;
+  const title = typeof task?.title === "string" ? task.title : "Untitled";
+  const u = task?.urgency;
+  const d = task?.duration;
+  return `• ${title} (u:${u} · ${d}m · ${shortId})`;
+}
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+function telegramHelpText() {
+  return [
+    "Task Thread (Telegram)",
+    "",
+    "Send any message to create, update, or cancel tasks in natural language.",
+    "",
+    "Commands:",
+    "/list — open tasks",
+    "/clear — cancel all open tasks",
+    "/help — this text"
+  ].join("\n");
+}
+
+async function dispatchTelegramMessage(chatId, textRaw) {
+  const text = String(textRaw || "").trim();
+  if (!text) return;
+
+  const lower = text.toLowerCase();
+  if (lower === "/start" || lower === "/help" || lower.startsWith("/help ")) {
+    await telegramSendMessage(chatId, telegramHelpText());
+    return;
+  }
+
+  if (lower === "/list" || lower.startsWith("/list ")) {
+    const tasks = await listOpenTasks();
+    if (!tasks.length) {
+      await telegramSendMessage(chatId, "No open tasks.");
+      return;
+    }
+    const body = ["Open tasks:", ...tasks.map(formatTaskListLine)].join("\n");
+    await telegramSendMessage(chatId, body);
+    return;
+  }
+
+  if (lower === "/clear" || lower.startsWith("/clear ")) {
+    try {
+      await clearAllOpenTasks();
+      await telegramSendMessage(chatId, "All open tasks canceled.");
+    } catch {
+      await telegramSendMessage(chatId, "Couldn’t clear tasks. Try again later.");
+    }
+    return;
+  }
+
+  try {
+    const payload = await processTaskQuery(text);
+    await telegramSendMessage(chatId, payload.message || "Done.");
+  } catch (error) {
+    const msg =
+      error && typeof error === "object" && "body" in error && error.body && typeof error.body.error === "string"
+        ? error.body.error
+        : error instanceof Error
+          ? error.message
+          : "I couldn’t update your tasks right now.";
+    await telegramSendMessage(chatId, msg);
+  }
+}
+
+async function handleTelegramUpdate(update) {
+  const msg = update?.message;
+  if (!msg || typeof msg.text !== "string") return;
+  const chatId = msg.chat?.id;
+  if (typeof chatId !== "number" && typeof chatId !== "string") return;
+  const id = typeof chatId === "string" ? Number(chatId) : chatId;
+  await dispatchTelegramMessage(id, msg.text);
+}
+
+let pollingOffset = 0;
+let pollingActive = false;
+
+async function telegramPollingLoop() {
+  const token = getTelegramBotToken();
+  if (!token || pollingActive) return;
+  pollingActive = true;
+
+  while (pollingActive) {
+    try {
+      const url = new URL(`https://api.telegram.org/bot${token}/getUpdates`);
+      url.searchParams.set("timeout", "50");
+      url.searchParams.set("offset", String(pollingOffset));
+
+      const response = await fetch(url.toString(), { method: "GET" });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || !data.ok || !Array.isArray(data.result)) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+
+      for (const update of data.result) {
+        pollingOffset = update.update_id + 1;
+        await handleTelegramUpdate(update);
+      }
+    } catch (err) {
+      console.error("Telegram polling error:", err);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
+function startTelegramPollingOrThrow() {
+  const token = getTelegramBotToken();
+  if (!token) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN in environment.");
+  }
+  console.log("Telegram long polling started.");
+  telegramPollingLoop();
+}
+
+startTelegramPollingOrThrow();
