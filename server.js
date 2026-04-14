@@ -9,6 +9,7 @@
 
 require("dotenv").config();
 
+const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
@@ -92,12 +93,16 @@ function buildFallbackMessageFromResults(results) {
   const created = countAppliedByType(results, "create");
   const updated = countAppliedByType(results, "update");
   const canceled = countAppliedByType(results, "delete");
+  const completed = countAppliedByType(results, "complete");
+  const pushed = countAppliedByType(results, "push");
   const failed = results.filter((r) => !r?.applied).length;
 
   const parts = [];
   if (created) parts.push(`Added ${created} ${created === 1 ? "task" : "tasks"}`);
   if (updated) parts.push(`Updated ${updated} ${updated === 1 ? "task" : "tasks"}`);
-  if (canceled) parts.push(`Canceled ${canceled} ${canceled === 1 ? "task" : "tasks"}`);
+  if (canceled) parts.push(`canceled ${canceled} ${canceled === 1 ? "task" : "tasks"}`);
+  if (completed) parts.push(`Completed ${completed} ${completed === 1 ? "task" : "tasks"}`);
+  if (pushed) parts.push(`Pushed ${pushed} ${pushed === 1 ? "task" : "tasks"} to tomorrow`);
   if (!parts.length) parts.push("No changes were applied");
   if (failed) parts.push(`${failed} failed`);
   return parts.join("; ") + ".";
@@ -144,8 +149,8 @@ function normalizeOperationPayload(raw) {
   const operationRaw = String(raw?.operation || "")
     .trim()
     .toLowerCase();
-  const operation =
-    operationRaw === "update" || operationRaw === "delete" ? operationRaw : "create";
+  const allowed = new Set(["create", "update", "delete", "complete", "push"]);
+  const operation = allowed.has(operationRaw) ? operationRaw : "create";
   const targetId = typeof raw?.targetId === "string" ? raw.targetId.trim() : "";
 
   if (operation === "create") {
@@ -205,17 +210,21 @@ async function processTaskQuery(query) {
     "You are a task operation parser.",
     "Given the user request and current task list, return JSON only with the shape:",
     '{ "operations": [ { operation, targetId, title, urgency, duration }, ... ], "message": "..." }',
-    'operation must be one of: "create" | "update" | "delete".',
+    'operation must be one of: "create" | "update" | "delete" | "complete" | "push".',
     "Return one operation per requested change. Multiple operations are allowed in one response.",
-    'Use operation "create" for new tasks, "update" for edits to existing tasks, and "delete" for cancel requests.',
-    "For update/delete, set targetId to the id of the existing task you want to change.",
+    'Use "create" for new tasks, "update" to change title/urgency/duration, "delete" when the user abandons a task (not doing it — maps to cancelled),',
+    '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am Eastern).',
+    "Current tasks lists only tasks with status open. Every targetId for update/delete/complete/push must be one of those ids.",
+    "For update/delete/complete/push, set targetId to the id of the existing task.",
     "For create, targetId should be null or omitted.",
-    "For update/delete, targetId must be one of the ids from Current tasks.",
     "Urgency must be 1-10, duration in minutes.",
     "For update, title/urgency/duration are optional; omit or set null to keep the current value.",
+    "For delete, complete, and push, title/urgency/duration are ignored.",
     "",
     'Also include a user-facing "message" string that summarizes what you did in friendly natural language.',
     'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
+    'In "message", never include urgency, duration, task ids, or any numeric or internal metadata.',
+    'Write "message" in natural conversational prose: use each task’s meaning, but weave it into full sentences the way you would in speech — paraphrase freely; do not recite or quote the stored task titles verbatim and do not present them as a stiff bulleted title list.',
     'If multiple changes happen, "message" should summarize them succinctly.',
     "",
     "Important: output JSON only. No prose. No markdown. No code fences.",
@@ -235,7 +244,7 @@ async function processTaskQuery(query) {
       },
       body: JSON.stringify({
         model: CLAUDE_MODEL,
-        max_tokens: 300,
+        max_tokens: 800,
         temperature: 0.2,
         messages: [{ role: "user", content: prompt }]
       })
@@ -320,10 +329,7 @@ async function processTaskQuery(query) {
       results.push({
         requested: op,
         applied: false,
-        error:
-          op.operation === "update"
-            ? "Missing or invalid targetId for update."
-            : "Missing or invalid targetId for cancel."
+        error: "Missing or invalid targetId for this operation."
       });
       continue;
     }
@@ -333,7 +339,6 @@ async function processTaskQuery(query) {
       if (op.fields.title) updatePayload.title = op.fields.title;
       if (op.fields.urgency !== undefined) updatePayload.urgency = op.fields.urgency;
       if (op.fields.duration !== undefined) updatePayload.duration = op.fields.duration;
-      updatePayload.updated_at = new Date().toISOString();
 
       if (!Object.keys(updatePayload).length) {
         results.push({
@@ -344,10 +349,13 @@ async function processTaskQuery(query) {
         continue;
       }
 
+      updatePayload.updated_at = new Date().toISOString();
+
       const { data: row, error } = await supabase
         .from("tasks")
         .update(updatePayload)
         .eq("id", op.targetId)
+        .eq("status", "open")
         .select("id,title,urgency,duration,status,created_at,updated_at")
         .single();
 
@@ -357,11 +365,42 @@ async function processTaskQuery(query) {
       }
 
       results.push({ requested: op, applied: true, task: row });
-    } else {
+    } else if (op.operation === "delete") {
       const { data: row, error } = await supabase
         .from("tasks")
         .update({ status: "canceled", updated_at: new Date().toISOString() })
         .eq("id", op.targetId)
+        .eq("status", "open")
+        .select("id,title,urgency,duration,status,created_at,updated_at")
+        .single();
+
+      if (error) {
+        results.push({ requested: op, applied: false, error: error.message });
+        continue;
+      }
+
+      results.push({ requested: op, applied: true, task: row });
+    } else if (op.operation === "complete") {
+      const { data: row, error } = await supabase
+        .from("tasks")
+        .update({ status: "completed", updated_at: new Date().toISOString() })
+        .eq("id", op.targetId)
+        .eq("status", "open")
+        .select("id,title,urgency,duration,status,created_at,updated_at")
+        .single();
+
+      if (error) {
+        results.push({ requested: op, applied: false, error: error.message });
+        continue;
+      }
+
+      results.push({ requested: op, applied: true, task: row });
+    } else if (op.operation === "push") {
+      const { data: row, error } = await supabase
+        .from("tasks")
+        .update({ status: "pushed", updated_at: new Date().toISOString() })
+        .eq("id", op.targetId)
+        .eq("status", "open")
         .select("id,title,urgency,duration,status,created_at,updated_at")
         .single();
 
@@ -448,7 +487,7 @@ function telegramHelpText() {
   return [
     "Task Thread (Telegram)",
     "",
-    "Send any message to create, update, or cancel tasks in natural language.",
+    "Send any message to manage tasks in natural language (add, edit, mark done, cancel, or push to tomorrow).",
     "",
     "Commands:",
     "/list — open tasks",
@@ -553,4 +592,34 @@ function startTelegramPollingOrThrow() {
   telegramPollingLoop();
 }
 
+async function runDailyRollover() {
+  const now = new Date().toISOString();
+  const { error: reopenError } = await supabase
+    .from("tasks")
+    .update({ status: "open", updated_at: now })
+    .eq("status", "pushed");
+
+  if (reopenError) {
+    console.error("Daily rollover: failed to reopen pushed tasks:", reopenError.message);
+  }
+
+  const { error: deleteError } = await supabase.from("tasks").delete().eq("status", "completed");
+
+  if (deleteError) {
+    console.error("Daily rollover: failed to delete completed tasks:", deleteError.message);
+  }
+}
+
+function startDailyRolloverCron() {
+  cron.schedule(
+    "0 5 * * *",
+    () => {
+      runDailyRollover().catch((err) => console.error("Daily rollover error:", err));
+    },
+    { timezone: "America/New_York" }
+  );
+  console.log("Daily rollover scheduled for 5:00 America/New_York (pushed→open, delete completed).");
+}
+
+startDailyRolloverCron();
 startTelegramPollingOrThrow();
