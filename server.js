@@ -1266,7 +1266,7 @@ function startNightlyDigestCron() {
 
 function startMorningMessageCron() {
   cron.schedule(
-    "25 12 * * *",
+    "30 5 * * *",
     () => {
       runMorningMessage().catch((err) => console.error("Morning message error:", err));
     },
