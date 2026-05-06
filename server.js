@@ -15,7 +15,7 @@ const { createClient } = require("@supabase/supabase-js");
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
 
 const TELEGRAM_MAX_MESSAGE_LEN = 4096;
-const AMERICA_NEW_YORK_TZ = "America/New_York";
+const AMERICA_LOS_ANGELES_TZ = "America/Los_Angeles";
 /** Minutes of free time until the next busy block (or horizon) required before sending a reminder. */
 const MIN_FREE_GAP_MINUTES_FOR_REMINDER = 30;
 
@@ -149,25 +149,25 @@ function makeDateInTimeZone(local, timeZone) {
 }
 
 function isWithinEtSendWindow(now = new Date()) {
-  const p = getZonedParts(now, AMERICA_NEW_YORK_TZ);
+  const p = getZonedParts(now, AMERICA_LOS_ANGELES_TZ);
   const minutes = p.hour * 60 + p.minute;
   return minutes >= 12 * 60 && minutes <= 22 * 60;
 }
 
 function getReminderDayStartEtUtc(now = new Date()) {
-  const p = getZonedParts(now, AMERICA_NEW_YORK_TZ);
+  const p = getZonedParts(now, AMERICA_LOS_ANGELES_TZ);
   const isBefore5am = p.hour < 5 || (p.hour === 5 && (p.minute < 0 || p.second < 0));
   // Note: minute/second comparisons above are defensive; p.minute/p.second are non-negative.
   const anchor = new Date(now.getTime());
   if (p.hour < 5) {
-    // Move to previous day in ET by subtracting 12h (safe) and re-read parts.
+    // Move to previous day in PT by subtracting 12h (safe) and re-read parts.
     anchor.setTime(anchor.getTime() - 12 * 60 * 60000);
   }
-  const a = getZonedParts(anchor, AMERICA_NEW_YORK_TZ);
+  const a = getZonedParts(anchor, AMERICA_LOS_ANGELES_TZ);
   void isBefore5am;
   return makeDateInTimeZone(
     { year: a.year, month: a.month, day: a.day, hour: 5, minute: 0, second: 0 },
-    AMERICA_NEW_YORK_TZ
+    AMERICA_LOS_ANGELES_TZ
   );
 }
 
@@ -518,7 +518,7 @@ async function processTaskQuery(query) {
     'operation must be one of: "create" | "update" | "delete" | "complete" | "push".',
     "Return one operation per requested change. Multiple operations are allowed in one response.",
     'Use "create" for new tasks, "update" to change title/urgency/duration, "delete" when the user abandons a task (not doing it — maps to cancelled),',
-    '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am Eastern).',
+    '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am Pacific).',
     "Current tasks lists only tasks with status open. Every targetId for update/delete/complete/push must be one of those ids.",
     "For update/delete/complete/push, set targetId to the id of the existing task.",
     "For create, targetId should be null or omitted.",
@@ -793,9 +793,9 @@ async function telegramSendMessage(chatId, text) {
 
 async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
   const apiKey = getApiKey();
-  const gapEndEt = gapEnd ? getZonedParts(gapEnd, AMERICA_NEW_YORK_TZ) : null;
-  const gapEndStr = gapEndEt
-    ? `${String(gapEndEt.hour).padStart(2, "0")}:${String(gapEndEt.minute).padStart(2, "0")} ET`
+  const gapEndPt = gapEnd ? getZonedParts(gapEnd, AMERICA_LOS_ANGELES_TZ) : null;
+  const gapEndStr = gapEndPt
+    ? `${String(gapEndPt.hour).padStart(2, "0")}:${String(gapEndPt.minute).padStart(2, "0")} PT`
     : "";
 
   const prompt = [
@@ -1147,10 +1147,10 @@ function startDailyRolloverCron() {
     () => {
       runDailyRollover().catch((err) => console.error("Daily rollover error:", err));
     },
-    { timezone: "America/New_York" }
+    { timezone: "America/Los_Angeles" }
   );
   console.log(
-    "Daily rollover scheduled for 5:00 America/New_York (pushed→open, delete completed + canceled)."
+    "Daily rollover scheduled for 5:00 America/Los_Angeles (pushed→open, delete completed + canceled)."
   );
 }
 
@@ -1218,9 +1218,9 @@ async function runSmartReminderTick() {
   } catch (err) {
     debug("Claude reminder copy failed; using fallback:", err instanceof Error ? err.message : err);
     const titles = picked.map((t) => t?.title).filter(Boolean);
-    const until = gap.gapEnd ? getZonedParts(gap.gapEnd, AMERICA_NEW_YORK_TZ) : null;
+    const until = gap.gapEnd ? getZonedParts(gap.gapEnd, AMERICA_LOS_ANGELES_TZ) : null;
     const untilStr = until
-      ? `${String(until.hour).padStart(2, "0")}:${String(until.minute).padStart(2, "0")} ET`
+      ? `${String(until.hour).padStart(2, "0")}:${String(until.minute).padStart(2, "0")} PT`
       : "";
     message = `You’ve got about ${gap.remainingMinutes} minutes free${
       untilStr ? ` (until around ${untilStr})` : ""
@@ -1247,10 +1247,10 @@ function startSmartReminderCron() {
     () => {
       runSmartReminderTick().catch((err) => console.error("Smart reminder tick error:", err));
     },
-    { timezone: AMERICA_NEW_YORK_TZ }
+    { timezone: AMERICA_LOS_ANGELES_TZ }
   );
   console.log(
-    "Smart reminders scheduled every 10 minutes (12:00–22:00 ET, ≥30 min free gap, caps + cooldown enforced)."
+    "Smart reminders scheduled every 10 minutes (12:00–22:00 PT, ≥30 min free gap, caps + cooldown enforced)."
   );
 }
 
@@ -1260,9 +1260,9 @@ function startNightlyDigestCron() {
     () => {
       runNightlyDigest().catch((err) => console.error("Nightly digest error:", err));
     },
-    { timezone: AMERICA_NEW_YORK_TZ }
+    { timezone: AMERICA_LOS_ANGELES_TZ }
   );
-  console.log("Nightly task digest scheduled for 22:00 America/New_York.");
+  console.log("Nightly task digest scheduled for 22:00 America/Los_Angeles.");
 }
 
 function startMorningMessageCron() {
@@ -1271,9 +1271,9 @@ function startMorningMessageCron() {
     () => {
       runMorningMessage().catch((err) => console.error("Morning message error:", err));
     },
-    { timezone: AMERICA_NEW_YORK_TZ }
+    { timezone: AMERICA_LOS_ANGELES_TZ }
   );
-  console.log("Morning message scheduled for 05:30 America/New_York.");
+  console.log("Morning message scheduled for 05:30 America/Los_Angeles.");
 }
 
 startDailyRolloverCron();
