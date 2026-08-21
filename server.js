@@ -21,8 +21,8 @@ const CHAT_HISTORY_MS = CHAT_HISTORY_DAYS * 24 * 60 * 60 * 1000;
 const RECENT_HISTORY_WINDOW_MS = 30 * 60 * 1000;
 const CHAT_HISTORY_TOOL_NAME = "search_chat_history";
 const SUBMIT_OPERATIONS_TOOL_NAME = "submit_operations";
-/** Minutes of free time until the next busy block (or horizon) required before sending a reminder. */
-const MIN_FREE_GAP_MINUTES_FOR_REMINDER = 30;
+/** Minutes of free time until the next busy block (or horizon) required before sending a nudge. */
+const MIN_FREE_GAP_MINUTES_FOR_NUDGE = 30;
 /** How far ahead to look for busy blocks. Every gate compares against <= 30 minutes. */
 const CALENDAR_HORIZON_HOURS = 6;
 
@@ -42,7 +42,7 @@ function requireEnv(name) {
 
 /**
  * Reads and validates every required variable once, at boot. Without this a missing
- * Google credential would not surface until the first midday reminder tick.
+ * Google credential would not surface until the first midday nudge tick.
  */
 function buildConfig() {
   const calendarIds = requireEnv("GOOGLE_CALENDAR_IDS")
@@ -123,7 +123,6 @@ const SETTING_DEFINITIONS = Object.freeze({
     description:
       'IANA timezone for all local schedules. Examples: "America/New_York" for Eastern and "America/Los_Angeles" for Pacific.',
     normalize: normalizeTimeZone,
-    formatValue: (value) => value,
     onChange: () => startScheduledJobs(),
     formatResult: ({ value, changed }) =>
       changed
@@ -278,7 +277,7 @@ function makeDateInTimeZone(local, timeZone) {
   return guess;
 }
 
-function isWithinReminderSendWindow(now = new Date()) {
+function isWithinNudgeSendWindow(now = new Date()) {
   const p = getZonedParts(now, getActiveTimeZone());
   const minutes = p.hour * 60 + p.minute;
   return minutes >= 12 * 60 && minutes <= 22 * 60;
@@ -641,31 +640,31 @@ async function listTasksForUserQuery() {
 }
 
 /**
- * One query answers both reminder gates. Looking only at today is safe for the cooldown:
- * the local send window opens at 12:00, so any reminder from a previous day is already
- * hours past the 120-minute cooldown.
+ * One query answers both nudge gates. Looking only at today is safe for the cooldown:
+ * the local send window opens at 12:00, so any nudge from a previous day is already
+ * hours past the 120-minute cooldown. Rows live in the `nudges` send-log table.
  */
-async function listRemindersSince(iso) {
+async function listNudgeSendsSince(iso) {
   const { data, error } = await supabase
-    .from("reminders")
+    .from("nudges")
     .select("created_at")
     .gte("created_at", iso)
     .order("created_at", { ascending: false });
-  if (error) throw new Error(`Supabase list reminders failed: ${error.message}`);
+  if (error) throw new Error(`Supabase list nudge sends failed: ${error.message}`);
   return Array.isArray(data) ? data : [];
 }
 
-async function insertReminder(taskIds) {
+async function insertNudgeSend(taskIds) {
   const { error } = await supabase
-    .from("reminders")
+    .from("nudges")
     .insert({ task_ids: Array.isArray(taskIds) ? taskIds : [] });
-  if (error) throw new Error(`Supabase insert reminder failed: ${error.message}`);
+  if (error) throw new Error(`Supabase insert nudge send failed: ${error.message}`);
 }
 
-async function clearAllReminders() {
+async function clearAllNudgeSends() {
   // Filter is required by PostgREST but must not assume whether id is numeric or a uuid.
-  const { error } = await supabase.from("reminders").delete().not("id", "is", null);
-  if (error) throw new Error(`Supabase clear reminders failed: ${error.message}`);
+  const { error } = await supabase.from("nudges").delete().not("id", "is", null);
+  if (error) throw new Error(`Supabase clear nudge sends failed: ${error.message}`);
 }
 
 async function insertConversationTurn({
@@ -759,12 +758,12 @@ async function deleteChatMessagesOlderThan(iso) {
   if (error) throw new Error(`Supabase delete expired chat messages failed: ${error.message}`);
 }
 
-async function canSendReminderNow(now = new Date()) {
-  if (!isWithinReminderSendWindow(now)) return { ok: false, reason: "outside_send_window" };
+async function canSendNudgeNow(now = new Date()) {
+  if (!isWithinNudgeSendWindow(now)) return { ok: false, reason: "outside_send_window" };
 
   const dayStart = getReminderDayStartUtc(now);
   const dayStartIso = dayStart.toISOString();
-  const sentToday = await listRemindersSince(dayStartIso);
+  const sentToday = await listNudgeSendsSince(dayStartIso);
   if (sentToday.length >= 3) return { ok: false, reason: "daily_cap" };
 
   const lastCreatedAt = sentToday[0]?.created_at;
@@ -777,17 +776,6 @@ async function canSendReminderNow(now = new Date()) {
   }
 
   return { ok: true, reason: "ok", dayStartIso, sentToday: sentToday.length };
-}
-
-async function clearAllOpenTasks() {
-  const { error } = await supabase
-    .from("tasks")
-    .update({ status: "canceled", updated_at: new Date().toISOString() })
-    .eq("status", "open");
-
-  if (error) {
-    throw new Error(error.message);
-  }
 }
 
 /** Terminal status each non-create, non-update operation moves an open task to. */
@@ -1196,6 +1184,8 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     'Use "set_setting" when the user asks to change a supported bot preference. Set key to an exact supported setting key and value to its new value.',
     'For timezone, translate phrases such as "Eastern time" to an IANA timezone such as "America/New_York".',
     "Never turn a request to change Tod’s behavior into a task. If the requested behavior is not a supported setting, return no operation for it and explain that limitation in message.",
+    "There are no slash commands. Treat every user message as natural language, including Telegram slash-style text such as /start or /list.",
+    "Do not create a task from slash-looking text unless the user is clearly adding a task. Help, /start, listing tasks, reading current settings, and canceling every open task are ordinary requests: empty operations for read-only answers, or one delete per currently open task when they ask to clear or cancel them all.",
     "",
     `Current time: ${now.toISOString()}.`,
     `Active timezone: ${getActiveTimeZone()}.`,
@@ -1425,12 +1415,12 @@ async function persistScheduledChatMessage(kind, content) {
   }
 }
 
-async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
+async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
   const gapEndStr = gapEnd ? formatZonedClock(gapEnd) : "";
 
   const prompt = [
     "You are a friendly personal productivity assistant.",
-    "Write a short reminder suggesting what the user could do right now.",
+    "Write a short message suggesting what the user could do right now.",
     "",
     "Constraints:",
     "- Plain text only (no markdown).",
@@ -1472,13 +1462,13 @@ async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
 
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text().catch(() => "");
-    throw new Error(`Anthropic reminder copy failed: ${claudeResponse.status} ${errorText.slice(0, 500)}`);
+    throw new Error(`Anthropic nudge copy failed: ${claudeResponse.status} ${errorText.slice(0, 500)}`);
   }
 
   const data = await claudeResponse.json();
   const textChunk = data?.content?.find((item) => item.type === "text")?.text;
   const msg = typeof textChunk === "string" ? textChunk.trim() : "";
-  if (!msg) throw new Error("Anthropic reminder copy was empty.");
+  if (!msg) throw new Error("Anthropic nudge copy was empty.");
   return msg;
 }
 
@@ -1536,15 +1526,6 @@ async function generateMorningCopy({ tasks }) {
   const msg = typeof textChunk === "string" ? textChunk.trim() : "";
   if (!msg) throw new Error("Anthropic morning copy was empty.");
   return msg;
-}
-
-function formatTaskListLine(task) {
-  const id = typeof task?.id === "string" ? task.id : "";
-  const shortId = id.length > 8 ? `${id.slice(0, 8)}…` : id;
-  const title = typeof task?.title === "string" ? task.title : "Untitled";
-  const u = task?.urgency;
-  const d = task?.duration;
-  return `• ${title} (u:${u} · ${d}m · ${shortId})`;
 }
 
 function buildNightlyDigestText({ open, completed, canceled }) {
@@ -1636,30 +1617,6 @@ async function runMorningMessage() {
   }
 }
 
-function telegramHelpText() {
-  return [
-    "Task Thread (Telegram)",
-    "",
-    "Send any message to manage tasks or supported bot settings in natural language.",
-    'For example: “I’m in Eastern time now.”',
-    "",
-    "Commands:",
-    "/list — open tasks",
-    "/settings — current bot settings",
-    "/clear — cancel all open tasks",
-    "/help — this text"
-  ].join("\n");
-}
-
-function telegramSettingsText() {
-  return [
-    "Bot settings:",
-    ...Object.entries(SETTING_DEFINITIONS).map(
-      ([key, definition]) => `• ${definition.label}: ${definition.formatValue(runtimeSettings[key])}`
-    )
-  ].join("\n");
-}
-
 async function dispatchTelegramMessage(chatId, textRaw, { telegramMessageId, receivedAt } = {}) {
   const text = String(textRaw || "").trim();
   if (!text) return;
@@ -1677,38 +1634,6 @@ async function dispatchTelegramMessage(chatId, textRaw, { telegramMessageId, rec
   };
   const sendReply = (replyText) =>
     telegramSendInteractiveReply({ ...replyContext, replyText: String(replyText) });
-
-  const lower = text.toLowerCase();
-  if (lower === "/start" || lower === "/help" || lower.startsWith("/help ")) {
-    await sendReply(telegramHelpText());
-    return;
-  }
-
-  if (lower === "/list" || lower.startsWith("/list ")) {
-    const tasks = await listOpenTasks();
-    if (!tasks.length) {
-      await sendReply("No open tasks.");
-      return;
-    }
-    const body = ["Open tasks:", ...tasks.map(formatTaskListLine)].join("\n");
-    await sendReply(body);
-    return;
-  }
-
-  if (lower === "/settings" || lower.startsWith("/settings ")) {
-    await sendReply(telegramSettingsText());
-    return;
-  }
-
-  if (lower === "/clear" || lower.startsWith("/clear ")) {
-    try {
-      await clearAllOpenTasks();
-      await sendReply("All open tasks canceled.");
-    } catch {
-      await sendReply("Couldn’t clear tasks. Try again later.");
-    }
-    return;
-  }
 
   try {
     const payload = await processUserQuery(text, {
@@ -1818,10 +1743,10 @@ async function runDailyRollover() {
   }
 
   try {
-    await clearAllReminders();
+    await clearAllNudgeSends();
   } catch (err) {
     console.error(
-      "Daily rollover: failed to clear reminders:",
+      "Daily rollover: failed to clear nudge sends:",
       err instanceof Error ? err.message : err
     );
   }
@@ -1836,15 +1761,15 @@ async function runDailyRollover() {
   }
 }
 
-async function runSmartReminderTick() {
+async function runNudgeTick() {
   const now = new Date();
   const debug = (...args) => {
-    if (config.debug) console.log("[smartreminder]", ...args);
+    if (config.debug) console.log("[nudge]", ...args);
   };
 
   let gates;
   try {
-    gates = await canSendReminderNow(now);
+    gates = await canSendNudgeNow(now);
   } catch (err) {
     debug("Gate check failed:", err instanceof Error ? err.message : err);
     return;
@@ -1870,8 +1795,8 @@ async function runSmartReminderTick() {
     return;
   }
   if (!gap.remainingMinutes || gap.remainingMinutes <= 0) return;
-  if (gap.remainingMinutes < MIN_FREE_GAP_MINUTES_FOR_REMINDER) {
-    debug("Gap too short for reminder:", gap.remainingMinutes, "<", MIN_FREE_GAP_MINUTES_FOR_REMINDER);
+  if (gap.remainingMinutes < MIN_FREE_GAP_MINUTES_FOR_NUDGE) {
+    debug("Gap too short for nudge:", gap.remainingMinutes, "<", MIN_FREE_GAP_MINUTES_FOR_NUDGE);
     return;
   }
 
@@ -1891,13 +1816,13 @@ async function runSmartReminderTick() {
 
   let message;
   try {
-    message = await generateReminderCopy({
+    message = await generateNudgeCopy({
       remainingMinutes: gap.remainingMinutes,
       gapEnd: gap.gapEnd,
       tasks: picked
     });
   } catch (err) {
-    debug("Claude reminder copy failed; using fallback:", err instanceof Error ? err.message : err);
+    debug("Claude nudge copy failed; using fallback:", err instanceof Error ? err.message : err);
     const titles = picked.map((t) => t?.title).filter(Boolean);
     const untilStr = gap.gapEnd ? formatZonedClock(gap.gapEnd) : "";
     message = `You’ve got about ${gap.remainingMinutes} minutes free${
@@ -1913,19 +1838,19 @@ async function runSmartReminderTick() {
   }
 
   try {
-    await insertReminder(picked.map((t) => t.id).filter((id) => typeof id === "string"));
+    await insertNudgeSend(picked.map((t) => t.id).filter((id) => typeof id === "string"));
   } catch (err) {
-    debug("Reminder persist failed:", err instanceof Error ? err.message : err);
+    debug("Nudge persist failed:", err instanceof Error ? err.message : err);
   }
 
-  await persistScheduledChatMessage("reminder", message);
+  await persistScheduledChatMessage("nudge", message);
 }
 
 const inFlightJobs = new Set();
 
 /**
  * Cron ticks are skipped, not queued, while the previous run is still going. Without this
- * a reminder tick that outlives its 10-minute interval could double-send.
+ * a nudge tick that outlives its 10-minute interval could double-send.
  */
 function runExclusive(name, fn) {
   return () => {
@@ -1946,13 +1871,13 @@ const SCHEDULED_JOBS = [
     name: "Daily rollover",
     expression: "0 5 * * *",
     run: runDailyRollover,
-    note: "05:00 local (roll tasks, clear reminders, delete expired chat history)"
+    note: "05:00 local (roll tasks, clear nudge sends, delete expired chat history)"
   },
   { name: "Morning message", expression: "30 5 * * *", run: runMorningMessage, note: "05:30 local" },
   {
-    name: "Smart reminder",
+    name: "Nudge",
     expression: "*/10 * * * *",
-    run: runSmartReminderTick,
+    run: runNudgeTick,
     note: "every 10 minutes (12:00–22:00 local, ≥30 min free gap, caps + cooldown enforced)"
   },
   { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 local" }

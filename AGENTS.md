@@ -2,7 +2,7 @@
 
 This file is the technical and operational source of truth for this repository. Read it before changing behavior, adding features, or touching deployment. Prefer this document over chat history.
 
-Product reminder rules that are implemented in code (caps, calendar gaps, Claude phrasing vs deterministic scheduling) are described here. There is no separate product-rules file in the repo; keep this document in sync when those rules change.
+Product nudge rules that are implemented in code (caps, calendar gaps, Claude phrasing vs deterministic scheduling) are described here. There is no separate product-rules file in the repo; keep this document in sync when those rules change.
 
 ## Who this is for
 
@@ -20,7 +20,7 @@ Do **not** optimize for multi-tenancy, enterprise auth, admin consoles, or “sc
 
 ## What this project is
 
-A personal **Telegram task assistant** plus **scheduled messages** (smart reminders, morning briefing, nightly digest, daily rollover).
+A personal **Telegram task assistant** plus **scheduled messages** (nudges, morning briefing, nightly digest, daily rollover).
 
 It is a **single long-running Node.js process** (`server.js`). It does **not** serve HTTP. It does **not** expose a public URL. Incoming messages arrive by **Telegram long polling** (`getUpdates`). Outbound work is HTTPS to Telegram, Anthropic, Google OAuth/Calendar, and Supabase.
 
@@ -36,7 +36,7 @@ Tyler (Telegram)  --getUpdates (long poll)-->  Node process (server.js)
          +------------------+------------------+----+------------------+
          |                  |                  |                       |
     Anthropic API           Google Calendar     Telegram sendMessage     Supabase
-    (task ops JSON +        (busy intervals)    (replies + scheduled)    (tasks, reminders,
+    (task ops JSON +        (busy intervals)    (replies + scheduled)    (tasks, nudges,
      on-demand history)                            copy)                   settings, history)
 ```
 
@@ -84,7 +84,7 @@ All names are read in `server.js`. Production (Railway **Variables** tab) must d
 | Name | Required | Purpose |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | yes (startup) | Bot API token; long poll + `sendMessage` |
-| `TELEGRAM_CHAT_ID` | yes (startup) | Destination for reminders, morning, nightly digest |
+| `TELEGRAM_CHAT_ID` | yes (startup) | Destination for nudges, morning, nightly digest |
 | `ANTHROPIC_API_KEY` | yes (startup) | Claude Messages API |
 | `CLAUDE_MODEL` | no | Default `claude-haiku-4-5-20251001` |
 | `SUPABASE_URL` | yes (startup) | Project URL |
@@ -93,10 +93,10 @@ All names are read in `server.js`. Production (Railway **Variables** tab) must d
 | `GOOGLE_CLIENT_SECRET` | yes (startup) | OAuth secret |
 | `GOOGLE_REFRESH_TOKEN` | yes (startup) | Offline token → access token |
 | `GOOGLE_CALENDAR_IDS` | yes (startup) | Comma-separated calendar IDs (e.g. `primary,user@gmail.com`) |
-| `DEBUG` | no | `true` enables extra reminder-tick logs and debug payloads on some errors. Production should be `false`. |
+| `DEBUG` | no | `true` enables extra nudge-tick logs and debug payloads on some errors. Production should be `false`. |
 | `NODE_ENV` | no | Set `production` on Railway |
 
-Telegram user **commands** (`/list`, `/help`, natural language) are handled for **any chat** that messages the bot. **Scheduled** messages always go to `TELEGRAM_CHAT_ID`, not necessarily the last chatter.
+Every incoming Telegram text message is handled as **natural language** for **any chat** that messages the bot. There are no slash-command shortcuts. **Scheduled** messages always go to `TELEGRAM_CHAT_ID`, not necessarily the last chatter.
 
 ## Data: Supabase
 
@@ -110,24 +110,24 @@ Columns used in code: `id` (UUID), `title`, `urgency` (1–10), `duration` (minu
 
 | Status | Meaning |
 | --- | --- |
-| `open` | Active to-do. Listed, editable, eligible for reminders/morning. |
+| `open` | Active to-do. Listed, editable, eligible for nudges/morning. |
 | `completed` | User finished it. Hidden from open lists. Deleted at the 05:00 local rollover. |
-| `canceled` | User abandoned it (`delete` op or `/clear`). Deleted at rollover. |
+| `canceled` | User abandoned it (`delete` op, including cancel-all). Deleted at rollover. |
 | `pushed` | Deferred to tomorrow. Reopened to `open` at the 05:00 local rollover. |
 
 For every natural-language user query, Claude receives one read-only snapshot of all currently retained statuses with `created_at` and `updated_at`, ordered newest first. `created_at` answers when a task was added; for a currently completed, canceled, or pushed row, `updated_at` marks when that status was applied because non-open rows cannot be changed again before rollover. “Today” for task-date questions starts at the active timezone’s **05:00 rollover**, not midnight. Completed and canceled rows remain available for these answers only until the next rollover deletes them.
 
 Claude may only target **open** rows for update/delete/complete/push, even though closed and pushed rows are visible as read-only context. The `.eq("status", "open")` database guards remain authoritative. Create always inserts `status: "open"`. Defaults if Claude omits numbers: urgency `5`, duration `30`, title `"Untitled Task"`.
 
-### `reminders`
+### `nudges`
 
-Used to persist **smart reminder** sends so caps survive restarts.
+Send log for **nudges** (gap-based task suggestions), so daily caps survive restarts. This table is not user-scheduled timed reminders.
 
 Columns used: `id`, `created_at`, `task_ids` (array of task UUIDs suggested in that send). Inserts do not set `created_at` in application code (DB default).
 
-Daily cap counts rows with `created_at >=` the current reminder-day start (05:00 in the active timezone). Cooldown uses the most recent row’s `created_at`. Rollover **deletes all reminder rows**.
+Daily cap counts rows with `created_at >=` the current 05:00 local day start (`getReminderDayStartUtc`). Cooldown uses the most recent row’s `created_at`. Rollover **deletes all `nudges` rows**.
 
-Both gates are answered by a **single** query for rows since the reminder-day start (`listRemindersSince`). Restricting the cooldown check to today is safe because the local send window opens at 12:00, so any reminder from a previous day is already hours past the 120-minute cooldown. The rollover delete filters on `.not("id", "is", null)` rather than comparing `id` to a number, so it works whether `id` is a bigint or a UUID.
+Both gates are answered by a **single** query for rows since that day start (`listNudgeSendsSince`). Restricting the cooldown check to today is safe because the local send window opens at 12:00, so any nudge from a previous day is already hours past the 120-minute cooldown. The rollover delete filters on `.not("id", "is", null)` rather than comparing `id` to a number, so it works whether `id` is a bigint or a UUID.
 
 ### `bot_settings`
 
@@ -143,7 +143,7 @@ Stores the configured owner chat’s user-visible conversation for on-demand Cla
 
 Interactive user/reply pairs share a `turn_id` and are inserted together only **after** the complete logical reply has been sent successfully to Telegram. This keeps the normal response path fast and prevents unsent assistant text from entering history. Store the original user text and exact user-visible reply, not raw Claude JSON, operations, tool calls, or debug payloads. A Telegram reply split into several 4096-character sends remains one assistant history row.
 
-Scheduled messages are stored as assistant-only turns with `kind` equal to `reminder`, `morning`, or `digest`. History writes and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history.
+Scheduled messages are stored as assistant-only turns with `kind` equal to `nudge`, `morning`, or `digest`. History writes and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history.
 
 The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool exposes two modes: `recent` for an unresolved omitted object/action/antecedent, defaulting to the previous 30 minutes with no keyword filter; and `search` for an explicit topic or time-range lookup, defaulting to the rolling seven days. It has **no result-count limit**; Node pages through PostgREST responses until every matching row has been loaded, then re-filters every row to the allowed interval so companion rows outside the seven-day boundary cannot leak through. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
 
@@ -153,16 +153,7 @@ Polling: `getUpdates` with `timeout=50`, `limit=10`, `allowed_updates=["message"
 
 Handling is **strictly serial**: the loop finishes one message (Claude call included) before fetching the next batch, which keeps replies in order. Do not make this concurrent without a reason; the stall risk it used to carry is handled by request timeouts instead.
 
-**Commands** (exact `/list`, `/settings`, `/help`, `/start`, `/clear`, also prefixes like `/list `):
-
-| Command | Behavior |
-| --- | --- |
-| `/start`, `/help` | Static help text |
-| `/list` | Open tasks with title, urgency, duration, truncated id (not Claude) |
-| `/settings` | Current allowlisted bot settings (not Claude) |
-| `/clear` | Sets all **open** tasks to `canceled` |
-
-Any other text goes to `processUserQuery`: Claude must finish through the structured `submit_operations` tool, whose input contains task/settings operations and a user-facing `message`. This process validates and applies the operations to Supabase, then sends the response. Task prose comes from Claude (or a fallback); setting confirmations come from deterministic apply results so the bot cannot claim a failed setting write succeeded.
+Every non-empty text message goes to `processUserQuery`. There are no `/list`, `/settings`, `/help`, `/start`, or `/clear` handlers: listing tasks, reading settings, help, Telegram’s automatic `/start`, and canceling every open task are ordinary Claude requests. Claude must finish through the structured `submit_operations` tool, whose input contains task/settings operations and a user-facing `message`. This process validates and applies the operations to Supabase, then sends the response. Task prose comes from Claude (or a fallback); setting confirmations come from deterministic apply results so the bot cannot claim a failed setting write succeeded. Cancel-all is one `delete` per currently open task, batched by `applyTaskOperations`.
 
 For the owner chat, the first `processUserQuery` Claude request exposes both `search_chat_history` and `submit_operations` but sends no past conversation. Tool choice is mandatory and parallel use is disabled: Claude either finishes immediately through `submit_operations` or performs one warranted history lookup. After a lookup, the second request exposes and forces only `submit_operations`, so another search is impossible. Non-owner chats receive only the forced submit tool.
 
@@ -187,29 +178,29 @@ The default timezone is `America/Los_Angeles`, but the owner can change it throu
 
 | Cron | Local wall clock | Function | Behavior |
 | --- | --- | --- | --- |
-| `0 5 * * *` | 05:00 | `runDailyRollover` | `pushed` → `open`; **delete** `completed` and `canceled`; **delete all** `reminders`; delete chat history older than seven days |
+| `0 5 * * *` | 05:00 | `runDailyRollover` | `pushed` → `open`; **delete** `completed` and `canceled`; **delete all** `nudges`; delete chat history older than seven days |
 | `30 5 * * *` | 05:30 | `runMorningMessage` | Claude morning copy from **open** tasks (fallback if Claude fails); send to `TELEGRAM_CHAT_ID` |
-| `*/10 * * * *` | every 10 min | `runSmartReminderTick` | Smart reminder (see below) |
+| `*/10 * * * *` | every 10 min | `runNudgeTick` | Nudge (see below) |
 | `0 22 * * *` | 22:00 | `runNightlyDigest` | Deterministic recap: completed / canceled / still open; **not** Claude |
 
 Jobs are registered from the `SCHEDULED_JOBS` table and wrapped in `runExclusive`, which **skips** a tick if the previous run of that same job is still in flight (it does not queue it). This also protects a timezone reschedule from overlapping an already-running old tick.
 
 If a job throws, it is logged; the process stays up.
 
-## Smart reminders (deterministic gates, Claude phrasing)
+## Nudges (deterministic gates, Claude phrasing)
 
-Implemented in `runSmartReminderTick` / `canSendReminderNow`. Product intent: remind only during real free time, about work that **fits the current gap**.
+Implemented in `runNudgeTick` / `canSendNudgeNow`. Product intent: suggest work only during real free time, about tasks that **fit the current gap**. Telegram copy stays suggestive prose; do not call these “nudges” in the user-facing text.
 
 **Eligibility (all must pass), in order:**
 
-1. Wall clock in the active timezone is between **12:00 and 22:00** inclusive (`isWithinReminderSendWindow`).
-2. Fewer than **3** reminder rows since **05:00 local** today (`getReminderDayStartUtc`).
-3. At least **120 minutes** since the latest reminder `created_at` (uses the most recent row since the reminder-day start).
+1. Wall clock in the active timezone is between **12:00 and 22:00** inclusive (`isWithinNudgeSendWindow`).
+2. Fewer than **3** `nudges` rows since **05:00 local** today (`getReminderDayStartUtc`).
+3. At least **120 minutes** since the latest nudge send `created_at` (uses the most recent row since the 05:00 day start).
 4. Google Calendar: current time is **not** inside a busy interval.
-5. Remaining free gap until next busy block (or the fetch horizon) is **≥ 30 minutes** (`MIN_FREE_GAP_MINUTES_FOR_REMINDER`).
+5. Remaining free gap until next busy block (or the fetch horizon) is **≥ 30 minutes** (`MIN_FREE_GAP_MINUTES_FOR_NUDGE`).
 6. At least one **open** task with `duration` ≤ remaining gap minutes.
 
-Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThatFit`). Claude writes 1–3 suggestive sentences. On Claude failure, a template fallback is sent. After a successful Telegram send, insert a `reminders` row (even if persist fails, the user already got the message — next tick may double-send if insert failed).
+Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThatFit`). Claude writes 1–3 suggestive sentences. On Claude failure, a template fallback is sent. After a successful Telegram send, insert a `nudges` row (even if persist fails, the user already got the message — next tick may double-send if insert failed).
 
 **Calendar “busy” rules** (`parseGoogleEventBusyInterval`):
 
@@ -220,7 +211,7 @@ Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThat
 - Fetch every ID in `GOOGLE_CALENDAR_IDS` **in parallel**, following `nextPageToken`, then merge overlapping intervals.
 - Horizon: now + **6 hours** (`CALENDAR_HORIZON_HOURS`).
 
-The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any decision — it only inflated the “you have about N minutes free” number on an empty calendar. If you raise it, cap what the reminder copy advertises.
+The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any decision — it only inflated the “you have about N minutes free” number on an empty calendar. If you raise it, cap what the nudge copy advertises.
 
 Requests send a `fields` mask (`CALENDAR_FIELDS_MASK`) covering only what `parseGoogleEventBusyInterval` reads, with `maxResults=250` per page. Widening the parser means widening the mask, or the new field will silently arrive as `undefined`.
 
@@ -231,7 +222,7 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 | Call | Role | Must not do |
 | --- | --- | --- |
 | `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps; optionally retrieve owner chat history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate closed tasks, or retrieve history for standalone/task-date requests |
-| `generateReminderCopy` | Phrase a reminder; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
+| `generateNudgeCopy` | Phrase a nudge; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
 | `generateMorningCopy` | Phrase morning briefing; temperature 0.6, max_tokens 220 | Same |
 
 Keep **scheduling, caps, gap math, and persistence in deterministic code**. Do not move those decisions into Claude.
@@ -253,7 +244,7 @@ Anthropic: `POST https://api.anthropic.com/v1/messages`, header `anthropic-versi
 - **Do not** enable an HTTP healthcheck on `$PORT` unless you also add a listener.
 - **Replicas: 1.** Two instances = two pollers.
 
-**Logs:** Railway deploy logs should show the four `Scheduled <job>:` registration lines with the active timezone followed by `Telegram long polling started.` Set `DEBUG=true` only when diagnosing reminder skips (`[smartreminder]`).
+**Logs:** Railway deploy logs should show the four `Scheduled <job>:` registration lines with the active timezone followed by `Telegram long polling started.` Set `DEBUG=true` only when diagnosing nudge skips (`[nudge]`).
 
 **Redeploys:** Railway sends `SIGTERM`, which the process handles by stopping the poll loop, finishing the message in hand, and exiting 0. Because the `getUpdates` offset is only advanced as updates are handled, an update interrupted by a deploy is redelivered rather than lost.
 
@@ -268,15 +259,15 @@ npm start
 ## Conventions for future changes
 
 - Keep the app a **single Node file** unless a split is clearly justified; if you split, update this document.
-- The default timezone is `America/Los_Angeles`; all user-facing schedules and reminder-day calculations use the current allowlisted `timezone` setting.
-- Do not add Trigger.dev, GitHub Actions cron, or a second process for reminders.
+- The default timezone is `America/Los_Angeles`; all user-facing schedules and 05:00 day-boundary calculations use the current allowlisted `timezone` setting.
+- Do not add Trigger.dev, GitHub Actions cron, or a second process for nudges.
 - Do not log secrets, tokens, or full `.env`.
 - Prefer fixing Railway by config (sleeping, healthcheck, replica count) over adding HTTP, unless the platform requires a bind.
-- When changing reminder product rules, update **both** `server.js` and this file in the same change.
-- After behavior changes, verify: one poller, `/list` still works, 05:00 rollover status transitions, reminder gates still deterministic.
+- When changing nudge product rules, update **both** `server.js` and this file in the same change.
+- After behavior changes, verify: one poller, listing tasks via natural language still works, 05:00 rollover status transitions, nudge gates still deterministic.
 - Treat network round trips as the thing to minimize; nothing here is CPU-bound. Batch Supabase writes, do not re-read rows the caller will not use, and never re-fetch a list just to return it up the stack.
 - Route new outbound calls through `fetchWithTimeout`, and read configuration from `config` rather than `process.env`.
-- Optimize for **the single owner’s convenience**: fewer steps, faster replies, stay in Telegram. Do not add auth, onboarding, settings screens, or “are you sure?” flows for routine task ops unless there is a real data-loss risk (`/clear` is the main bulk-destructive command).
+- Optimize for **the single owner’s convenience**: fewer steps, faster replies, stay in Telegram. Do not add auth, onboarding, settings screens, slash commands, or “are you sure?” flows for routine task ops unless there is a real data-loss risk (canceling every open task via natural language is the main bulk-destructive action).
 - Prefer one Claude call per user message. The only normal exception is the single on-demand chat-history tool round when the current request genuinely requires prior conversation.
 - Keep conversation history owner-only, enforce the rolling seven-day window in every search, and persist only exact user-visible messages after successful Telegram sends.
 - Keep natural-language behavior changes allowlisted and deterministic: add a settings-registry entry, validation, persistence, and explicit application in Node rather than giving Claude free-form control.
@@ -285,7 +276,7 @@ npm start
 ## Out of scope (unless product explicitly changes)
 
 - Webhook mode for Telegram (would need a public HTTPS URL and a rewrite of the poller). Long polling is the current low-ops path.
-- Multi-user tenancy, teams, or per-user accounts (scheduled chat ID is a single env var; commands currently accept any chat that knows the bot).
+- Multi-user tenancy, teams, or per-user accounts (scheduled chat ID is a single env var; any chat that knows the bot can send natural-language messages).
 - Local Postgres; source of truth is hosted Supabase.
 - GPIO / Raspberry Pi–specific code. Hardware is not part of production.
 - Marketing site, admin dashboard, or a second client besides Telegram.
