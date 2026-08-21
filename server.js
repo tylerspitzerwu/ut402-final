@@ -23,6 +23,8 @@ const CHAT_HISTORY_TOOL_NAME = "search_chat_history";
 const SUBMIT_OPERATIONS_TOOL_NAME = "submit_operations";
 /** Minutes of free time until the next busy block (or horizon) required before sending a nudge. */
 const MIN_FREE_GAP_MINUTES_FOR_NUDGE = 30;
+const MAX_NUDGES_PER_DAY = 3;
+const NUDGE_COOLDOWN_MINUTES = 120;
 /** How far ahead to look for busy blocks. Every gate compares against <= 30 minutes. */
 const CALENDAR_HORIZON_HOURS = 6;
 
@@ -211,14 +213,8 @@ function fetchWithTimeout(url, options, timeoutMs) {
   return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
 }
 
-function buildDebugPayload(payload) {
-  return config.debug ? payload : undefined;
-}
-
-function taskError(errorMessage, debugDetails) {
-  const err = new Error(errorMessage);
-  err.body = { error: errorMessage, debug: buildDebugPayload(debugDetails) };
-  return err;
+function taskError(errorMessage) {
+  return new Error(errorMessage);
 }
 
 const zonedPartsFormatters = new Map();
@@ -470,8 +466,14 @@ function normalizeRecurrence(raw) {
   if (freq === "weekly") {
     const days = Array.isArray(raw.byWeekday) ? raw.byWeekday : [];
     const normalized = [
-      ...new Set(days.map((day) => parseIntegerInRange(day, { min: 0, max: 6 })))
-    ].filter((day) => day !== null);
+      ...new Set(
+        days.map((day) => {
+          const parsed = parseIntegerInRange(day, { min: 0, max: 7 });
+          if (parsed === null) throw new Error("A weekly reminder needs valid weekdays.");
+          return parsed === 7 ? 0 : parsed;
+        })
+      )
+    ];
     if (!normalized.length) throw new Error("A weekly reminder needs at least one weekday.");
     recurrence.byWeekday = normalized.sort((a, b) => a - b);
   }
@@ -633,7 +635,7 @@ function isWithinNudgeSendWindow(now = new Date()) {
   return minutes >= 12 * 60 && minutes <= 22 * 60;
 }
 
-function getReminderDayStartUtc(now = new Date()) {
+function getLocalDayStartUtc(now = new Date()) {
   const timeZone = getActiveTimeZone();
   const p = getZonedParts(now, timeZone);
   const anchor = new Date(now.getTime());
@@ -863,7 +865,7 @@ function buildFallbackMessageFromResults(results) {
   const parts = [];
   if (created) parts.push(`Added ${created} ${created === 1 ? "task" : "tasks"}`);
   if (updated) parts.push(`Updated ${updated} ${updated === 1 ? "task" : "tasks"}`);
-  if (canceled) parts.push(`canceled ${canceled} ${canceled === 1 ? "task" : "tasks"}`);
+  if (canceled) parts.push(`Canceled ${canceled} ${canceled === 1 ? "task" : "tasks"}`);
   if (completed) parts.push(`Completed ${completed} ${completed === 1 ? "task" : "tasks"}`);
   if (pushed) parts.push(`Pushed ${pushed} ${pushed === 1 ? "task" : "tasks"} to tomorrow`);
   if (!parts.length) parts.push("No changes were applied");
@@ -871,48 +873,24 @@ function buildFallbackMessageFromResults(results) {
   return parts.join("; ") + ".";
 }
 
-function normalizeMessage(rawMessage) {
-  if (typeof rawMessage !== "string") return "";
-  const trimmed = rawMessage.trim();
-  return trimmed;
-}
-
 function normalizeTaskTitle(raw) {
   const title = typeof raw === "string" ? raw.trim() : "";
   return title || "Untitled Task";
 }
 
+function parseClampedInteger(rawValue, { min = -Infinity, max = Infinity } = {}) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") return undefined;
+  const value = Number(rawValue);
+  if (!Number.isFinite(value)) return undefined;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
 function normalizeUrgency(raw) {
-  const value = Number(raw);
-  if (!Number.isFinite(value)) return 5;
-  return Math.min(10, Math.max(1, Math.round(value)));
+  return parseClampedInteger(raw, { min: 1, max: 10 }) ?? 5;
 }
 
 function normalizeDuration(raw) {
-  const value = Number(raw);
-  if (!Number.isFinite(value)) return 30;
-  return Math.max(1, Math.round(value));
-}
-
-function parseOptionalUrgency(rawValue) {
-  if (rawValue === undefined || rawValue === null || rawValue === "") return undefined;
-  const value = Number(rawValue);
-  if (!Number.isFinite(value)) return undefined;
-  return Math.min(10, Math.max(1, Math.round(value)));
-}
-
-function parseOptionalDuration(rawValue) {
-  if (rawValue === undefined || rawValue === null || rawValue === "") return undefined;
-  const value = Number(rawValue);
-  if (!Number.isFinite(value)) return undefined;
-  return Math.max(1, Math.round(value));
-}
-
-function parseOptionalMinutes(rawValue) {
-  if (rawValue === undefined || rawValue === null || rawValue === "") return undefined;
-  const value = Number(rawValue);
-  if (!Number.isFinite(value)) return undefined;
-  return Math.round(value);
+  return parseClampedInteger(raw, { min: 1 }) ?? 30;
 }
 
 function normalizeOperationPayload(raw) {
@@ -932,7 +910,7 @@ function normalizeOperationPayload(raw) {
       reminderId: typeof raw?.reminderId === "string" ? raw.reminderId.trim() : "",
       body: typeof raw?.body === "string" ? raw.body.trim() : "",
       dueLocal: typeof raw?.dueLocal === "string" ? raw.dueLocal.trim() : "",
-      inMinutes: parseOptionalMinutes(raw?.inMinutes),
+      inMinutes: parseClampedInteger(raw?.inMinutes),
       // Kept raw so applyReminderOperations can report a per-operation validation reason.
       recurrence: raw?.recurrence ?? null
     };
@@ -965,8 +943,8 @@ function normalizeOperationPayload(raw) {
     targetId,
     fields: {
       title: typeof raw?.title === "string" ? raw.title.trim() : "",
-      urgency: parseOptionalUrgency(raw?.urgency),
-      duration: parseOptionalDuration(raw?.duration)
+      urgency: parseClampedInteger(raw?.urgency, { min: 1, max: 10 }),
+      duration: parseClampedInteger(raw?.duration, { min: 1 })
     }
   };
 }
@@ -976,21 +954,17 @@ const TASK_COLUMNS = "id,title,urgency,duration";
 const USER_QUERY_TASK_COLUMNS = `${TASK_COLUMNS},status,created_at,updated_at`;
 const USER_QUERY_TASK_STATUSES = ["open", "completed", "canceled", "pushed"];
 
-async function listTasksByStatus(status) {
+async function listOpenTasks() {
   const { data, error } = await supabase
     .from("tasks")
     .select(TASK_COLUMNS)
-    .eq("status", status)
+    .eq("status", "open")
     .order("created_at", { ascending: false });
 
   if (error) {
     throw new Error(`Supabase list tasks failed: ${error.message}`);
   }
   return Array.isArray(data) ? data : [];
-}
-
-async function listOpenTasks() {
-  return listTasksByStatus("open");
 }
 
 /** One round trip for several statuses at once, grouped in memory. */
@@ -1233,17 +1207,17 @@ async function deleteChatMessagesOlderThan(iso) {
 async function canSendNudgeNow(now = new Date()) {
   if (!isWithinNudgeSendWindow(now)) return { ok: false, reason: "outside_send_window" };
 
-  const dayStart = getReminderDayStartUtc(now);
+  const dayStart = getLocalDayStartUtc(now);
   const dayStartIso = dayStart.toISOString();
   const sentToday = await listNudgeSendsSince(dayStartIso);
-  if (sentToday.length >= 3) return { ok: false, reason: "daily_cap" };
+  if (sentToday.length >= MAX_NUDGES_PER_DAY) return { ok: false, reason: "daily_cap" };
 
   const lastCreatedAt = sentToday[0]?.created_at;
   if (lastCreatedAt) {
     const lastTs = new Date(lastCreatedAt);
     if (Number.isFinite(lastTs.getTime())) {
       const minsSince = (now.getTime() - lastTs.getTime()) / 60000;
-      if (minsSince < 120) return { ok: false, reason: "cooldown" };
+      if (minsSince < NUDGE_COOLDOWN_MINUTES) return { ok: false, reason: "cooldown" };
     }
   }
 
@@ -1713,12 +1687,13 @@ function buildUserQueryMessage(parsedMessage, operations, results) {
   const taskOperations = operations.filter((op) => TASK_OPERATIONS.has(op.operation));
   const deterministicOperations = operations.filter((op) => hasDeterministicMessage(op.operation));
   const taskResults = results.filter((result) => TASK_OPERATIONS.has(result?.requested?.operation));
+  const message = typeof parsedMessage === "string" ? parsedMessage.trim() : "";
   const parts = [];
 
   if (taskOperations.length) {
-    parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(taskResults));
+    parts.push(message || buildFallbackMessageFromResults(taskResults));
   } else if (!deterministicOperations.length) {
-    parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(results));
+    parts.push(message || buildFallbackMessageFromResults(results));
   }
 
   for (const result of results) {
@@ -1846,7 +1821,8 @@ const SUBMIT_OPERATIONS_TOOL = Object.freeze({
                 byWeekday: {
                   type: "array",
                   items: { type: "number" },
-                  description: "Required for weekly. 0 is Sunday through 6 is Saturday."
+                  description:
+                    "Required for weekly. 0 or 7 is Sunday; 1 is Monday through 6 is Saturday."
                 },
                 byMonthDay: {
                   type: "number",
@@ -1909,10 +1885,7 @@ function requireSingleToolUse(data, allowedNames) {
     !toolUse ||
     !allowedNames.includes(toolUse.name)
   ) {
-    throw taskError("I couldn’t understand the assistant response.", {
-      type: "anthropic_invalid_tool_use",
-      toolNames: toolUses.map((item) => item?.name).filter(Boolean)
-    });
+    throw taskError("I couldn’t understand the assistant response.");
   }
   return toolUse;
 }
@@ -1942,23 +1915,12 @@ async function requestClaudeUserQuery({ messages, tools, toolChoice }) {
       },
       TIMEOUT_MS.anthropic
     );
-  } catch (error) {
-    throw taskError("I couldn’t handle that request right now.", {
-      type: "anthropic_fetch_failed",
-      details:
-        error instanceof Error
-          ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-          : "Unknown fetch error"
-    });
+  } catch {
+    throw taskError("I couldn’t handle that request right now.");
   }
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw taskError("I couldn’t handle that request right now.", {
-      type: "anthropic_api_error",
-      status: response.status,
-      details: errorText.slice(0, 2000)
-    });
+    throw taskError("I couldn’t handle that request right now.");
   }
 
   return response.json();
@@ -1968,7 +1930,7 @@ async function processUserQuery(query, { allowSettings, chatId }) {
   const allowHistory = isOwnerChat(chatId);
   const now = new Date();
   const timeZone = getActiveTimeZone();
-  const taskDayStart = getReminderDayStartUtc(now);
+  const taskDayStart = getLocalDayStartUtc(now);
   // One round trip each, in parallel: neither snapshot depends on the other.
   const [currentTasks, pendingReminders] = await Promise.all([
     listTasksForUserQuery(),
@@ -2066,11 +2028,8 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     let history;
     try {
       history = await searchChatHistory({ chatId, ...searchInput });
-    } catch (error) {
-      throw taskError("I couldn’t look up the earlier conversation right now.", {
-        type: "chat_history_search_failed",
-        details: error instanceof Error ? error.message : String(error)
-      });
+    } catch {
+      throw taskError("I couldn’t look up the earlier conversation right now.");
     }
 
     data = await requestClaudeUserQuery({
@@ -2104,14 +2063,8 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     // anyway, and task replies fall back to a deterministic summary. Only a missing
     // operations array is fatal, which normalizeOperationListPayload still rejects.
     operations = normalizeOperationListPayload(toolUse.input);
-  } catch (error) {
-    throw taskError("I couldn’t understand the assistant response.", {
-      type: "anthropic_invalid_submission",
-      details:
-        error instanceof Error
-          ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}`
-          : "Unknown submission parse error"
-    });
+  } catch {
+    throw taskError("I couldn’t understand the assistant response.");
   }
 
   const results = await applyUserOperations(operations, { allowSettings, chatId, now });
@@ -2270,6 +2223,38 @@ async function persistScheduledChatMessage(kind, content) {
   }
 }
 
+async function requestClaudeText({ prompt, maxTokens, temperature, label }) {
+  const response = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": config.anthropicApiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: config.claudeModel,
+        max_tokens: maxTokens,
+        temperature,
+        messages: [{ role: "user", content: prompt }]
+      })
+    },
+    TIMEOUT_MS.anthropic
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`Anthropic ${label} failed: ${response.status} ${errorText.slice(0, 500)}`);
+  }
+
+  const data = await response.json();
+  const textChunk = data?.content?.find((item) => item.type === "text")?.text;
+  const message = typeof textChunk === "string" ? textChunk.trim() : "";
+  if (!message) throw new Error(`Anthropic ${label} was empty.`);
+  return message;
+}
+
 async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
   const gapEndStr = gapEnd ? formatZonedClock(gapEnd) : "";
 
@@ -2296,35 +2281,7 @@ async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
     )
   ].join("\n");
 
-  const claudeResponse = await fetchWithTimeout(
-    "https://api.anthropic.com/v1/messages",
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": config.anthropicApiKey,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: config.claudeModel,
-        max_tokens: 200,
-        temperature: 0.4,
-        messages: [{ role: "user", content: prompt }]
-      })
-    },
-    TIMEOUT_MS.anthropic
-  );
-
-  if (!claudeResponse.ok) {
-    const errorText = await claudeResponse.text().catch(() => "");
-    throw new Error(`Anthropic nudge copy failed: ${claudeResponse.status} ${errorText.slice(0, 500)}`);
-  }
-
-  const data = await claudeResponse.json();
-  const textChunk = data?.content?.find((item) => item.type === "text")?.text;
-  const msg = typeof textChunk === "string" ? textChunk.trim() : "";
-  if (!msg) throw new Error("Anthropic nudge copy was empty.");
-  return msg;
+  return requestClaudeText({ prompt, maxTokens: 200, temperature: 0.4, label: "nudge copy" });
 }
 
 async function generateMorningCopy({ tasks }) {
@@ -2352,35 +2309,7 @@ async function generateMorningCopy({ tasks }) {
     JSON.stringify(titles)
   ].join("\n");
 
-  const claudeResponse = await fetchWithTimeout(
-    "https://api.anthropic.com/v1/messages",
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": config.anthropicApiKey,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: config.claudeModel,
-        max_tokens: 220,
-        temperature: 0.6,
-        messages: [{ role: "user", content: prompt }]
-      })
-    },
-    TIMEOUT_MS.anthropic
-  );
-
-  if (!claudeResponse.ok) {
-    const errorText = await claudeResponse.text().catch(() => "");
-    throw new Error(`Anthropic morning copy failed: ${claudeResponse.status} ${errorText.slice(0, 500)}`);
-  }
-
-  const data = await claudeResponse.json();
-  const textChunk = data?.content?.find((item) => item.type === "text")?.text;
-  const msg = typeof textChunk === "string" ? textChunk.trim() : "";
-  if (!msg) throw new Error("Anthropic morning copy was empty.");
-  return msg;
+  return requestClaudeText({ prompt, maxTokens: 220, temperature: 0.6, label: "morning copy" });
 }
 
 function buildNightlyDigestText({ open, completed, canceled }) {
@@ -2498,11 +2427,7 @@ async function dispatchTelegramMessage(chatId, textRaw, { telegramMessageId, rec
     await sendReply(payload.message || "Done.");
   } catch (error) {
     const msg =
-      error && typeof error === "object" && "body" in error && error.body && typeof error.body.error === "string"
-        ? error.body.error
-        : error instanceof Error
-          ? error.message
-          : "I couldn’t handle that request right now.";
+      error instanceof Error ? error.message : "I couldn’t handle that request right now.";
     await sendReply(msg);
   }
 }
@@ -2512,9 +2437,8 @@ async function handleTelegramUpdate(update) {
   if (!msg || typeof msg.text !== "string") return;
   const chatId = msg.chat?.id;
   if (typeof chatId !== "number" && typeof chatId !== "string") return;
-  const id = typeof chatId === "string" ? Number(chatId) : chatId;
   const telegramDateSeconds = Number(msg.date);
-  await dispatchTelegramMessage(id, msg.text, {
+  await dispatchTelegramMessage(chatId, msg.text, {
     telegramMessageId: msg.message_id,
     receivedAt:
       Number.isFinite(telegramDateSeconds) && telegramDateSeconds > 0
@@ -2723,7 +2647,7 @@ async function runNudgeTick() {
     return;
   }
 
-  const picked = pickTopTasksThatFit({ tasks, remainingMinutes: gap.remainingMinutes, maxTasks: 3 });
+  const picked = pickTopTasksThatFit({ tasks, remainingMinutes: gap.remainingMinutes });
   if (!picked.length) {
     debug("No tasks fit remaining gap:", gap.remainingMinutes);
     return;
@@ -2825,8 +2749,14 @@ async function fireRecurringReminder(row, { now, timeZone, debug }) {
         time_zone: timeZone
       });
       debug("Rezoned instead of firing:", row.id, rezoned.toISOString());
-      return;
+    } else {
+      await updatePendingReminder(row.id, {
+        status: REMINDER_STATUS.exhausted,
+        time_zone: timeZone
+      });
+      debug("Exhausted while rezoning instead of firing:", row.id);
     }
+    return;
   }
 
   const occurrencesSent = Number(row.occurrences_sent || 0) + 1;
