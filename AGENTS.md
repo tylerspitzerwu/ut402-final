@@ -35,9 +35,9 @@ Tyler (Telegram)  --getUpdates (long poll)-->  Node process (server.js)
                                                     |
          +------------------+------------------+----+------------------+
          |                  |                  |                       |
-    Anthropic API      Google Calendar     Telegram sendMessage     Supabase
-    (task ops JSON     (busy intervals)    (replies + scheduled)    (tasks, reminders)
-     + reminder/morning copy)
+    Anthropic API           Google Calendar     Telegram sendMessage     Supabase
+    (task ops JSON +        (busy intervals)    (replies + scheduled)    (tasks, reminders,
+     on-demand history)                            copy)                   settings, history)
 ```
 
 - **Entry:** `npm start` → `node server.js` (`package.json`).
@@ -100,7 +100,7 @@ Telegram user **commands** (`/list`, `/help`, natural language) are handled for 
 
 ## Data: Supabase
 
-Three tables. The service role key is used from this process only.
+Four tables. The service role key is used from this process only.
 
 ### `tasks`
 
@@ -135,6 +135,16 @@ The first supported key is `timezone`, stored as a canonical IANA identifier suc
 
 Credentials remain in frozen environment-backed `config`; preferences live in a separate mutable in-memory settings object loaded from this table. A setting change is normalized and validated, upserted first, and only then applied in memory. Adding a future natural-language preference requires an explicit entry in the settings registry with validation and any apply side effect—Claude cannot invent keys or arbitrary behavior.
 
+### `chat_messages`
+
+Stores the configured owner chat’s user-visible conversation for on-demand Claude retrieval. Columns used in code: `id` (UUID), `turn_id` (UUID), `chat_id` (text), `telegram_message_id` (nullable bigint), `role` (`user` or `assistant`), `kind`, `content`, `created_at`, plus the generated `search_vector` used by PostgreSQL full-text search.
+
+Interactive user/reply pairs share a `turn_id` and are inserted together only **after** the complete logical reply has been sent successfully to Telegram. This keeps the normal response path fast and prevents unsent assistant text from entering history. Store the original user text and exact user-visible reply, not raw Claude JSON, operations, tool calls, or debug payloads. A Telegram reply split into several 4096-character sends remains one assistant history row.
+
+Scheduled messages are stored as assistant-only turns with `kind` equal to `reminder`, `morning`, or `digest`. History writes and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history.
+
+The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. It has **no result-count limit**; Node pages through PostgREST responses until every matching row has been loaded, then re-filters every row to the allowed interval so companion rows outside the seven-day boundary cannot leak through. An empty query returns every turn in the requested interval. Both Node and the RPC clamp access to the rolling previous seven days, and the 05:00 rollover physically deletes older rows. This means stale rows remain inaccessible if cleanup fails.
+
 ## Telegram interaction
 
 Polling: `getUpdates` with `timeout=50`, `limit=10`, `allowed_updates=["message"]`, offset advanced per `update_id`. Only `message.text` is handled (no photos, callbacks, etc.). On HTTP/API failure the loop waits 3s and retries.
@@ -151,6 +161,10 @@ Handling is **strictly serial**: the loop finishes one message (Claude call incl
 | `/clear` | Sets all **open** tasks to `canceled` |
 
 Any other text goes to `processUserQuery`: Claude returns JSON operations; this process applies them to Supabase, then sends a user-facing response. Task prose comes from Claude (or a fallback); setting confirmations come from deterministic apply results so the bot cannot claim a failed setting write succeeded.
+
+For the owner chat, the first `processUserQuery` Claude request also exposes a `search_chat_history` tool but sends no past conversation. Claude may call it at most once only when the current request contains an unresolved reference to prior conversation or explicitly asks about it. Standalone requests remain one Claude call and never query chat history. A warranted lookup adds one RPC and one final Claude call; the second call cannot invoke another tool.
+
+The server, not Claude, supplies the owner chat ID and clamps requested timestamps. Retrieved messages are context only: old requests do not authorize new task operations. Only the current Telegram message may cause writes.
 
 **Operations Claude may emit:** `create` | `update` | `delete` | `complete` | `push` | `set_setting`.
 
@@ -171,7 +185,7 @@ The default timezone is `America/Los_Angeles`, but the owner can change it throu
 
 | Cron | Local wall clock | Function | Behavior |
 | --- | --- | --- | --- |
-| `0 5 * * *` | 05:00 | `runDailyRollover` | `pushed` → `open`; **delete** `completed` and `canceled`; **delete all** `reminders` |
+| `0 5 * * *` | 05:00 | `runDailyRollover` | `pushed` → `open`; **delete** `completed` and `canceled`; **delete all** `reminders`; delete chat history older than seven days |
 | `30 5 * * *` | 05:30 | `runMorningMessage` | Claude morning copy from **open** tasks (fallback if Claude fails); send to `TELEGRAM_CHAT_ID` |
 | `*/10 * * * *` | every 10 min | `runSmartReminderTick` | Smart reminder (see below) |
 | `0 22 * * *` | 22:00 | `runNightlyDigest` | Deterministic recap: completed / canceled / still open; **not** Claude |
@@ -214,7 +228,7 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 
 | Call | Role | Must not do |
 | --- | --- | --- |
-| `processUserQuery` | Parse NL → task/settings JSON ops + task-facing `message`; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, or claim setting success |
+| `processUserQuery` | Parse NL → task/settings JSON ops + task-facing `message`; optionally retrieve owner chat history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, or retrieve history for standalone requests |
 | `generateReminderCopy` | Phrase a reminder; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
 | `generateMorningCopy` | Phrase morning briefing; temperature 0.6, max_tokens 220 | Same |
 
@@ -261,7 +275,8 @@ npm start
 - Treat network round trips as the thing to minimize; nothing here is CPU-bound. Batch Supabase writes, do not re-read rows the caller will not use, and never re-fetch a list just to return it up the stack.
 - Route new outbound calls through `fetchWithTimeout`, and read configuration from `config` rather than `process.env`.
 - Optimize for **the single owner’s convenience**: fewer steps, faster replies, stay in Telegram. Do not add auth, onboarding, settings screens, or “are you sure?” flows for routine task ops unless there is a real data-loss risk (`/clear` is the main bulk-destructive command).
-- Prefer one Claude call per user message over multi-step agent loops.
+- Prefer one Claude call per user message. The only normal exception is the single on-demand chat-history tool round when the current request genuinely requires prior conversation.
+- Keep conversation history owner-only, enforce the rolling seven-day window in every search, and persist only exact user-visible messages after successful Telegram sends.
 - Keep natural-language behavior changes allowlisted and deterministic: add a settings-registry entry, validation, persistence, and explicit application in Node rather than giving Claude free-form control.
 - Reliability of always-on scheduling beats extra features that make the bot slower or require opening another app.
 
