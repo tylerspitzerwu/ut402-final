@@ -26,6 +26,12 @@ const MIN_FREE_GAP_MINUTES_FOR_NUDGE = 30;
 /** How far ahead to look for busy blocks. Every gate compares against <= 30 minutes. */
 const CALENDAR_HORIZON_HOURS = 6;
 
+const REMINDER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const REMINDER_MAX_SEND_ATTEMPTS = 3;
+/** A one-off further out than this is almost certainly a misparsed year. */
+const REMINDER_MAX_LEAD_MS = 5 * 365 * 24 * 60 * 60 * 1000;
+const REMINDER_MAX_BODY_LEN = 500;
+
 /** Per-destination request timeouts. The long poll needs headroom over its own timeout=50. */
 const TIMEOUT_MS = {
   anthropic: 20000,
@@ -60,7 +66,7 @@ function buildConfig() {
     supabaseUrl: requireEnv("SUPABASE_URL"),
     supabaseKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
     telegramBotToken: requireEnv("TELEGRAM_BOT_TOKEN"),
-    reminderChatId: Number.isFinite(chatIdNum) ? chatIdNum : chatIdRaw,
+    ownerChatId: Number.isFinite(chatIdNum) ? chatIdNum : chatIdRaw,
     google: Object.freeze({
       clientId: requireEnv("GOOGLE_CLIENT_ID"),
       clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
@@ -123,7 +129,20 @@ const SETTING_DEFINITIONS = Object.freeze({
     description:
       'IANA timezone for all local schedules. Examples: "America/New_York" for Eastern and "America/Los_Angeles" for Pacific.',
     normalize: normalizeTimeZone,
-    onChange: () => startScheduledJobs(),
+    onChange: async (value) => {
+      startScheduledJobs();
+      try {
+        const moved = await rescheduleRecurringReminders(value);
+        if (moved) console.log(`Rescheduled ${moved} recurring reminder(s) for ${value}.`);
+      } catch (err) {
+        // The timezone itself saved. A stale next_due_at is caught and rezoned by
+        // fireRecurringReminder before it can fire at the old wall clock.
+        console.error(
+          "Timezone change: failed to reschedule recurring reminders:",
+          err instanceof Error ? err.message : err
+        );
+      }
+    },
     formatResult: ({ value, changed }) =>
       changed
         ? `Timezone set to ${value}. Scheduled messages now follow that local time.`
@@ -144,7 +163,7 @@ function getActiveTimeZone() {
 }
 
 function isOwnerChat(chatId) {
-  return String(chatId) === String(config.reminderChatId);
+  return String(chatId) === String(config.ownerChatId);
 }
 
 async function loadRuntimeSettings() {
@@ -183,7 +202,7 @@ async function persistRuntimeSetting(key, rawValue) {
 
   runtimeSettings[key] = value;
   const changed = previousValue !== value;
-  if (changed) definition.onChange?.(value, previousValue);
+  if (changed) await definition.onChange?.(value, previousValue);
   return { key, value, changed };
 }
 
@@ -275,6 +294,337 @@ function makeDateInTimeZone(local, timeZone) {
     guess = new Date(guess.getTime() + deltaMs);
   }
   return guess;
+}
+
+/**
+ * Calendar arithmetic on local dates. Recurrence must advance in wall-clock terms:
+ * adding 86400000ms to the previous instant silently shifts "every day at 8am" by an
+ * hour at each DST transition.
+ */
+function toLocalDate(parts) {
+  return { year: parts.year, month: parts.month, day: parts.day };
+}
+
+function localDateUtcMs(date) {
+  return Date.UTC(date.year, date.month - 1, date.day);
+}
+
+function addLocalDays(date, amount) {
+  const d = new Date(localDateUtcMs(date));
+  d.setUTCDate(d.getUTCDate() + amount);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+function daysBetweenLocalDates(from, to) {
+  return Math.round((localDateUtcMs(to) - localDateUtcMs(from)) / 86400000);
+}
+
+function localWeekday(date) {
+  return new Date(localDateUtcMs(date)).getUTCDay();
+}
+
+function daysInLocalMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function positiveModulo(value, divisor) {
+  return ((value % divisor) + divisor) % divisor;
+}
+
+function wallClockRank(parts) {
+  return (
+    parts.year * 100000000 +
+    parts.month * 1000000 +
+    parts.day * 10000 +
+    parts.hour * 100 +
+    parts.minute
+  );
+}
+
+/**
+ * A DST spring-forward skips a whole hour of wall clock, so a reminder set for 02:30 on
+ * that date names a time that never happens and makeDateInTimeZone cannot converge on it.
+ * Fire at the first instant the clock reaches instead of an hour off.
+ */
+function findFirstInstantAtOrAfterWallClock(local, timeZone) {
+  const target = wallClockRank({ ...local, second: 0 });
+  const midnight = makeDateInTimeZone(
+    { year: local.year, month: local.month, day: local.day, hour: 0, minute: 0, second: 0 },
+    timeZone
+  );
+  let low = midnight.getTime() - 6 * 3600000;
+  let high = low + 36 * 3600000;
+
+  while (high - low > 60000) {
+    const mid = low + Math.floor((high - low) / 120000) * 60000;
+    if (mid <= low || mid >= high) break;
+    if (wallClockRank(getZonedParts(new Date(mid), timeZone)) >= target) high = mid;
+    else low = mid;
+  }
+  return new Date(high);
+}
+
+/**
+ * Local wall clock -> instant, verified by round trip. During a fall-back the requested
+ * clock time happens twice; makeDateInTimeZone settles on one of them, which is what keeps
+ * a repeating reminder from firing twice that night.
+ */
+function resolveZonedWallClock(local, timeZone) {
+  const instant = makeDateInTimeZone({ ...local, second: 0 }, timeZone);
+  const got = getZonedParts(instant, timeZone);
+  if (
+    got.year === local.year &&
+    got.month === local.month &&
+    got.day === local.day &&
+    got.hour === local.hour &&
+    got.minute === local.minute
+  ) {
+    return instant;
+  }
+  return findFirstInstantAtOrAfterWallClock(local, timeZone);
+}
+
+const RECURRENCE_FREQUENCIES = new Set(["daily", "weekly", "monthly", "yearly"]);
+const MAX_RECURRENCE_INTERVAL = 366;
+const MAX_RECURRENCE_COUNT = 1000;
+/** Bounds the candidate walk so a rule that can never match cannot spin. */
+const RECURRENCE_SEARCH_LIMIT = Object.freeze({ days: 400, months: 60, years: 12 });
+const LOCAL_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+const WEEKDAY_LABELS = Object.freeze([
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday"
+]);
+const MONTH_LABELS = Object.freeze([
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December"
+]);
+
+function parseLocalDateString(raw) {
+  const match = LOCAL_DATE_PATTERN.exec(String(raw || "").trim());
+  if (!match) return null;
+  const date = {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3])
+  };
+  if (date.month < 1 || date.month > 12) return null;
+  if (date.day < 1 || date.day > daysInLocalMonth(date.year, date.month)) return null;
+  return date;
+}
+
+function parseIntegerInRange(raw, { min, max }) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  const rounded = Math.round(value);
+  if (rounded < min || rounded > max) return null;
+  return rounded;
+}
+
+/**
+ * Validates a structured recurrence into the canonical jsonb shape. Anything Claude
+ * invents outside this shape is rejected rather than coerced, so a misread schedule
+ * cannot quietly become a different one.
+ */
+function normalizeRecurrence(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("I didn’t understand that repeating schedule.");
+  }
+
+  const freq = String(raw.freq || "").trim().toLowerCase();
+  if (!RECURRENCE_FREQUENCIES.has(freq)) {
+    throw new Error("I can only repeat reminders daily, weekly, monthly, or yearly.");
+  }
+
+  const interval =
+    raw.interval === undefined || raw.interval === null || raw.interval === ""
+      ? 1
+      : parseIntegerInRange(raw.interval, { min: 1, max: MAX_RECURRENCE_INTERVAL });
+  if (interval === null) throw new Error("That repeat interval is out of range.");
+
+  const hour = parseIntegerInRange(raw.hour, { min: 0, max: 23 });
+  if (hour === null) throw new Error("A repeating reminder needs a time of day.");
+  const minute =
+    raw.minute === undefined || raw.minute === null || raw.minute === ""
+      ? 0
+      : parseIntegerInRange(raw.minute, { min: 0, max: 59 });
+  if (minute === null) throw new Error("A repeating reminder needs a valid time of day.");
+
+  const recurrence = { freq, interval, hour, minute };
+
+  if (freq === "weekly") {
+    const days = Array.isArray(raw.byWeekday) ? raw.byWeekday : [];
+    const normalized = [
+      ...new Set(days.map((day) => parseIntegerInRange(day, { min: 0, max: 6 })))
+    ].filter((day) => day !== null);
+    if (!normalized.length) throw new Error("A weekly reminder needs at least one weekday.");
+    recurrence.byWeekday = normalized.sort((a, b) => a - b);
+  }
+
+  if (freq === "monthly" || freq === "yearly") {
+    const monthDay = parseIntegerInRange(raw.byMonthDay, { min: 1, max: 31 });
+    if (monthDay === null) throw new Error("That repeating reminder needs a day of the month.");
+    recurrence.byMonthDay = monthDay;
+  }
+
+  if (freq === "yearly") {
+    const month = parseIntegerInRange(raw.month, { min: 1, max: 12 });
+    if (month === null) throw new Error("A yearly reminder needs a month.");
+    recurrence.month = month;
+  }
+
+  if (raw.until !== undefined && raw.until !== null && raw.until !== "") {
+    if (!parseLocalDateString(raw.until)) throw new Error("I didn’t understand that end date.");
+    recurrence.until = String(raw.until).trim();
+  }
+
+  if (raw.count !== undefined && raw.count !== null && raw.count !== "") {
+    const count = parseIntegerInRange(raw.count, { min: 1, max: MAX_RECURRENCE_COUNT });
+    if (count === null) throw new Error("That repeat count is out of range.");
+    recurrence.count = count;
+  }
+
+  return recurrence;
+}
+
+/**
+ * Candidate local dates in ascending order. The anchor fixes the phase of an interval
+ * greater than one, so "every other Monday" keeps its parity across a timezone change or
+ * a recompute rather than resetting to whenever the recompute happened.
+ */
+function* iterateCandidateDates(recurrence, { anchorDate, startDate }) {
+  const { freq, interval } = recurrence;
+
+  if (freq === "daily" || freq === "weekly") {
+    for (let offset = 0; offset <= RECURRENCE_SEARCH_LIMIT.days; offset++) {
+      const date = addLocalDays(startDate, offset);
+      if (freq === "daily") {
+        if (positiveModulo(daysBetweenLocalDates(anchorDate, date), interval) !== 0) continue;
+      } else {
+        if (!recurrence.byWeekday.includes(localWeekday(date))) continue;
+        const anchorWeekStart = addLocalDays(anchorDate, -localWeekday(anchorDate));
+        const dateWeekStart = addLocalDays(date, -localWeekday(date));
+        const weeksApart = daysBetweenLocalDates(anchorWeekStart, dateWeekStart) / 7;
+        if (positiveModulo(weeksApart, interval) !== 0) continue;
+      }
+      yield date;
+    }
+    return;
+  }
+
+  if (freq === "monthly") {
+    const anchorIndex = anchorDate.year * 12 + (anchorDate.month - 1);
+    const startIndex = startDate.year * 12 + (startDate.month - 1);
+    for (let offset = 0; offset <= RECURRENCE_SEARCH_LIMIT.months; offset++) {
+      const index = startIndex + offset;
+      if (positiveModulo(index - anchorIndex, interval) !== 0) continue;
+      const year = Math.floor(index / 12);
+      const month = (index % 12) + 1;
+      // "Monthly on the 31st" clamps to the last day of a short month instead of skipping it.
+      yield { year, month, day: Math.min(recurrence.byMonthDay, daysInLocalMonth(year, month)) };
+    }
+    return;
+  }
+
+  for (let offset = 0; offset <= RECURRENCE_SEARCH_LIMIT.years; offset++) {
+    const year = startDate.year + offset;
+    if (positiveModulo(year - anchorDate.year, interval) !== 0) continue;
+    const month = recurrence.month;
+    yield { year, month, day: Math.min(recurrence.byMonthDay, daysInLocalMonth(year, month)) };
+  }
+}
+
+/** First occurrence strictly after `after`, or null when the series has run out. */
+function computeNextOccurrence(recurrence, { after, timeZone, anchor }) {
+  const anchorInstant = anchor instanceof Date && Number.isFinite(anchor.getTime()) ? anchor : after;
+  const anchorDate = toLocalDate(getZonedParts(anchorInstant, timeZone));
+  const startDate = toLocalDate(getZonedParts(after, timeZone));
+
+  const untilDate = recurrence.until ? parseLocalDateString(recurrence.until) : null;
+  const untilMs = untilDate
+    ? resolveZonedWallClock({ ...untilDate, hour: 23, minute: 59 }, timeZone).getTime()
+    : null;
+
+  for (const date of iterateCandidateDates(recurrence, { anchorDate, startDate })) {
+    const instant = resolveZonedWallClock(
+      { ...date, hour: recurrence.hour, minute: recurrence.minute },
+      timeZone
+    );
+    if (instant.getTime() <= after.getTime()) continue;
+    if (untilMs !== null && instant.getTime() > untilMs) return null;
+    return instant;
+  }
+  return null;
+}
+
+function formatLocalClock(hour, minute) {
+  const suffix = hour < 12 ? "AM" : "PM";
+  const hour12 = hour % 12 === 0 ? 12 : hour % 12;
+  return `${hour12}:${String(minute).padStart(2, "0")} ${suffix}`;
+}
+
+function joinWithAnd(items) {
+  if (items.length <= 1) return items[0] || "";
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+}
+
+function ordinal(value) {
+  const mod100 = value % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${value}th`;
+  const suffixes = { 1: "st", 2: "nd", 3: "rd" };
+  return `${value}${suffixes[value % 10] || "th"}`;
+}
+
+function formatLocalDateLabel(raw) {
+  const date = parseLocalDateString(raw);
+  if (!date) return String(raw || "");
+  return `${MONTH_LABELS[date.month - 1].slice(0, 3)} ${date.day}, ${date.year}`;
+}
+
+/** English rendering used for confirmations and for the snapshot Claude reads. */
+function describeRecurrence(recurrence) {
+  const { freq, interval } = recurrence;
+  const every = (unit) => (interval === 1 ? `every ${unit}` : `every ${interval} ${unit}s`);
+
+  let base;
+  if (freq === "daily") {
+    base = every("day");
+  } else if (freq === "weekly") {
+    const days = recurrence.byWeekday;
+    const isWeekdays = days.length === 5 && [1, 2, 3, 4, 5].every((day) => days.includes(day));
+    const isWeekend = days.length === 2 && days.includes(0) && days.includes(6);
+    if (interval === 1 && isWeekdays) base = "every weekday";
+    else if (interval === 1 && isWeekend) base = "every weekend day";
+    else {
+      const names = joinWithAnd(days.map((day) => WEEKDAY_LABELS[day]));
+      base = interval === 1 ? `every ${names}` : `${every("week")} on ${names}`;
+    }
+  } else if (freq === "monthly") {
+    base = `${every("month")} on the ${ordinal(recurrence.byMonthDay)}`;
+  } else {
+    base = `${every("year")} on ${MONTH_LABELS[recurrence.month - 1]} ${recurrence.byMonthDay}`;
+  }
+
+  let description = `${base} at ${formatLocalClock(recurrence.hour, recurrence.minute)}`;
+  if (recurrence.until) description += ` until ${formatLocalDateLabel(recurrence.until)}`;
+  if (recurrence.count) description += ` (${recurrence.count} times)`;
+  return description;
 }
 
 function isWithinNudgeSendWindow(now = new Date()) {
@@ -479,6 +829,24 @@ function normalizeOperationListPayload(raw) {
 }
 
 const TASK_OPERATIONS = new Set(["create", "update", "delete", "complete", "push"]);
+const REMINDER_OPERATIONS = new Set(["create_reminder", "update_reminder", "cancel_reminder"]);
+
+const REMINDER_STATUS = Object.freeze({
+  pending: "pending",
+  sending: "sending",
+  sent: "sent",
+  canceled: "canceled",
+  failed: "failed",
+  exhausted: "exhausted"
+});
+/** Rows the firing job and a timezone recompute may still act on. */
+const REMINDER_LIVE_STATUSES = Object.freeze([REMINDER_STATUS.pending, REMINDER_STATUS.sending]);
+const REMINDER_TERMINAL_STATUSES = Object.freeze([
+  REMINDER_STATUS.sent,
+  REMINDER_STATUS.canceled,
+  REMINDER_STATUS.failed,
+  REMINDER_STATUS.exhausted
+]);
 
 function countAppliedByType(results, operation) {
   return results.filter((r) => r?.requested?.operation === operation && r.applied).length;
@@ -540,6 +908,13 @@ function parseOptionalDuration(rawValue) {
   return Math.max(1, Math.round(value));
 }
 
+function parseOptionalMinutes(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") return undefined;
+  const value = Number(rawValue);
+  if (!Number.isFinite(value)) return undefined;
+  return Math.round(value);
+}
+
 function normalizeOperationPayload(raw) {
   const operationRaw = String(raw?.operation || "")
     .trim()
@@ -551,6 +926,18 @@ function normalizeOperationPayload(raw) {
       value: raw?.value
     };
   }
+  if (REMINDER_OPERATIONS.has(operationRaw)) {
+    return {
+      operation: operationRaw,
+      reminderId: typeof raw?.reminderId === "string" ? raw.reminderId.trim() : "",
+      body: typeof raw?.body === "string" ? raw.body.trim() : "",
+      dueLocal: typeof raw?.dueLocal === "string" ? raw.dueLocal.trim() : "",
+      inMinutes: parseOptionalMinutes(raw?.inMinutes),
+      // Kept raw so applyReminderOperations can report a per-operation validation reason.
+      recurrence: raw?.recurrence ?? null
+    };
+  }
+
   if (!TASK_OPERATIONS.has(operationRaw)) {
     return {
       operation: "invalid",
@@ -665,6 +1052,91 @@ async function clearAllNudgeSends() {
   // Filter is required by PostgREST but must not assume whether id is numeric or a uuid.
   const { error } = await supabase.from("nudges").delete().not("id", "is", null);
   if (error) throw new Error(`Supabase clear nudge sends failed: ${error.message}`);
+}
+
+const REMINDER_COLUMNS =
+  "id,chat_id,body,status,next_due_at,recurrence,time_zone,attempts,occurrences_sent,created_at";
+
+async function listPendingReminders() {
+  const { data, error } = await supabase
+    .from("scheduled_reminders")
+    .select(REMINDER_COLUMNS)
+    .eq("status", REMINDER_STATUS.pending)
+    .order("next_due_at", { ascending: true });
+  if (error) throw new Error(`Supabase list reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data : [];
+}
+
+async function listDueReminders(nowIso) {
+  const { data, error } = await supabase
+    .from("scheduled_reminders")
+    .select(REMINDER_COLUMNS)
+    .eq("status", REMINDER_STATUS.pending)
+    .lte("next_due_at", nowIso)
+    .order("next_due_at", { ascending: true });
+  if (error) throw new Error(`Supabase list due reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data : [];
+}
+
+async function listLiveRecurringReminders() {
+  const { data, error } = await supabase
+    .from("scheduled_reminders")
+    .select(REMINDER_COLUMNS)
+    .in("status", REMINDER_LIVE_STATUSES)
+    .not("recurrence", "is", null);
+  if (error) throw new Error(`Supabase list recurring reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data : [];
+}
+
+async function getRemindersByIds(ids) {
+  if (!ids.length) return [];
+  const { data, error } = await supabase
+    .from("scheduled_reminders")
+    .select(REMINDER_COLUMNS)
+    .in("id", ids);
+  if (error) throw new Error(`Supabase load reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * Returns false when the status guard matched nothing, which is how a reminder canceled
+ * between the read and the write is detected, the way .eq("status", "open") protects
+ * closed tasks.
+ */
+async function markReminder(id, payload, { requireStatus } = {}) {
+  let query = supabase
+    .from("scheduled_reminders")
+    .update({ ...payload, updated_at: new Date().toISOString() })
+    .eq("id", id);
+  if (requireStatus) query = query.eq("status", requireStatus);
+
+  const { data, error } = await query.select("id");
+  if (error) throw new Error(`Supabase update reminder failed: ${error.message}`);
+  return Array.isArray(data) && data.length > 0;
+}
+
+function updatePendingReminder(id, payload) {
+  return markReminder(id, payload, { requireStatus: REMINDER_STATUS.pending });
+}
+
+async function deleteTerminalRemindersOlderThan(iso) {
+  const { error } = await supabase
+    .from("scheduled_reminders")
+    .delete()
+    .in("status", REMINDER_TERMINAL_STATUSES)
+    .lt("updated_at", iso);
+  if (error) throw new Error(`Supabase delete expired reminders failed: ${error.message}`);
+}
+
+/** A crash between claiming and sending leaves a row in `sending`; put it back in line. */
+async function reclaimStuckReminders() {
+  const { data, error } = await supabase
+    .from("scheduled_reminders")
+    .update({ status: REMINDER_STATUS.pending, updated_at: new Date().toISOString() })
+    .eq("status", REMINDER_STATUS.sending)
+    .select("id");
+  if (error) throw new Error(`Supabase reclaim reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data.length : 0;
 }
 
 async function insertConversationTurn({
@@ -895,6 +1367,269 @@ async function applyTaskOperations(operations) {
   return results;
 }
 
+const DUE_LOCAL_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$/;
+
+/** Claude sends local wall clock, never UTC; Node owns the conversion. */
+function parseDueLocal(raw) {
+  const match = DUE_LOCAL_PATTERN.exec(String(raw || "").trim());
+  if (!match) return null;
+  const local = {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5])
+  };
+  if (local.month < 1 || local.month > 12) return null;
+  if (local.day < 1 || local.day > daysInLocalMonth(local.year, local.month)) return null;
+  if (local.hour > 23 || local.minute > 59) return null;
+  return local;
+}
+
+function normalizeReminderBody(raw) {
+  const body = typeof raw === "string" ? raw.trim().replace(/\s+/g, " ") : "";
+  if (!body) throw new Error("I need to know what to remind you about.");
+  return body.slice(0, REMINDER_MAX_BODY_LEN);
+}
+
+function assertReminderLead(due, now) {
+  if (due.getTime() - now.getTime() > REMINDER_MAX_LEAD_MS) {
+    throw new Error("That date is too far in the future.");
+  }
+}
+
+function resolveOneOffDue(op, { now, timeZone }) {
+  if (op.inMinutes !== undefined) {
+    if (op.inMinutes < 1) throw new Error("That reminder needs to be at least a minute from now.");
+    const due = new Date(now.getTime() + op.inMinutes * 60000);
+    assertReminderLead(due, now);
+    return due;
+  }
+
+  const local = parseDueLocal(op.dueLocal);
+  if (!local) throw new Error("I need a time for that reminder.");
+
+  let due = resolveZonedWallClock(local, timeZone);
+  if (due.getTime() <= now.getTime()) {
+    // A bare clock time that already passed today means the next occurrence of that wall
+    // clock. An explicitly past date stays past and is rejected below rather than shifted.
+    due = resolveZonedWallClock(
+      { ...addLocalDays(local, 1), hour: local.hour, minute: local.minute },
+      timeZone
+    );
+  }
+  if (due.getTime() <= now.getTime()) throw new Error("That time has already passed.");
+  assertReminderLead(due, now);
+  return due;
+}
+
+function buildReminderRow(op, { chatId, now, timeZone }) {
+  const body = normalizeReminderBody(op.body);
+  const recurrence = normalizeRecurrence(op.recurrence);
+
+  if (recurrence) {
+    const next = computeNextOccurrence(recurrence, { after: now, timeZone, anchor: now });
+    if (!next) throw new Error("That repeating schedule has no upcoming date.");
+    return {
+      chat_id: String(chatId),
+      body,
+      status: REMINDER_STATUS.pending,
+      next_due_at: next.toISOString(),
+      recurrence,
+      time_zone: timeZone
+    };
+  }
+
+  return {
+    chat_id: String(chatId),
+    body,
+    status: REMINDER_STATUS.pending,
+    next_due_at: resolveOneOffDue(op, { now, timeZone }).toISOString(),
+    recurrence: null,
+    time_zone: timeZone
+  };
+}
+
+function buildReminderUpdate(op, current, { now, timeZone }) {
+  const body = op.body ? normalizeReminderBody(op.body) : current.body;
+  const wantsOneOffTime = Boolean(op.dueLocal) || op.inMinutes !== undefined;
+  const wantsRecurrence = op.recurrence !== null && op.recurrence !== undefined;
+
+  let recurrence = current.recurrence || null;
+  let nextDueAt = current.next_due_at;
+
+  if (wantsRecurrence) {
+    recurrence = normalizeRecurrence(op.recurrence);
+    const next = computeNextOccurrence(recurrence, { after: now, timeZone, anchor: now });
+    if (!next) throw new Error("That repeating schedule has no upcoming date.");
+    nextDueAt = next.toISOString();
+  } else if (wantsOneOffTime) {
+    recurrence = null;
+    nextDueAt = resolveOneOffDue(op, { now, timeZone }).toISOString();
+  }
+
+  const resolved = { body, recurrence, next_due_at: nextDueAt };
+  return { payload: { ...resolved, time_zone: timeZone }, resolved };
+}
+
+function buildReminderScheduleMessage(row, { timeZone, now, lead, nextLabel = "First one" }) {
+  const when = formatZonedDayTime(new Date(row.next_due_at), timeZone, now);
+  if (row.recurrence) {
+    return `${lead} ${describeRecurrence(row.recurrence)} to ${row.body}. ${nextLabel} ${when}.`;
+  }
+  return `${lead} ${when} to ${row.body}.`;
+}
+
+function reminderFailureMessage(error) {
+  const message = error instanceof Error ? String(error.message || "").trim() : "";
+  return message || "I couldn’t set that reminder.";
+}
+
+/**
+ * Confirmations are built from what was actually written, for the same reason setting
+ * confirmations are: the bot must never claim a 2pm reminder exists when the write failed.
+ */
+async function applyReminderOperations(operations, { chatId, now }) {
+  const results = [];
+  const timeZone = getActiveTimeZone();
+  const inserts = [];
+  const cancels = [];
+  const updates = [];
+
+  for (const op of operations) {
+    if (op.operation === "create_reminder") {
+      try {
+        inserts.push({ op, row: buildReminderRow(op, { chatId, now, timeZone }) });
+      } catch (err) {
+        results.push({ requested: op, applied: false, userMessage: reminderFailureMessage(err) });
+      }
+      continue;
+    }
+
+    if (!isUuid(op.reminderId)) {
+      results.push({ requested: op, applied: false, userMessage: "I couldn’t find that reminder." });
+      continue;
+    }
+
+    if (op.operation === "cancel_reminder") cancels.push(op);
+    else updates.push(op);
+  }
+
+  if (inserts.length) {
+    const { data, error } = await supabase
+      .from("scheduled_reminders")
+      .insert(inserts.map((entry) => entry.row))
+      .select("id");
+
+    // Confirmations use the locally computed row, so returned row order does not matter.
+    const applied = !error && Array.isArray(data) && data.length === inserts.length;
+    for (const entry of inserts) {
+      results.push({
+        requested: entry.op,
+        applied,
+        userMessage: applied
+          ? buildReminderScheduleMessage(entry.row, {
+              timeZone,
+              now,
+              lead: "Okay, I’ll remind you"
+            })
+          : "I couldn’t save that reminder right now."
+      });
+    }
+  }
+
+  if (cancels.length) {
+    const ids = [...new Set(cancels.map((op) => op.reminderId))];
+    const { data, error } = await supabase
+      .from("scheduled_reminders")
+      .update({ status: REMINDER_STATUS.canceled, updated_at: now.toISOString() })
+      .in("id", ids)
+      .eq("status", REMINDER_STATUS.pending)
+      .select("id,body");
+
+    // Ids the guard did not match were already canceled, fired, or never existed.
+    const bodyById = new Map((Array.isArray(data) ? data : []).map((row) => [row.id, row.body]));
+    for (const op of cancels) {
+      const body = bodyById.get(op.reminderId);
+      const applied = !error && body !== undefined;
+      results.push({
+        requested: op,
+        applied,
+        userMessage: applied
+          ? `Canceled your reminder to ${body}.`
+          : error
+            ? "I couldn’t cancel that reminder right now."
+            : "That reminder isn’t active anymore."
+      });
+    }
+  }
+
+  if (updates.length) {
+    const ids = [...new Set(updates.map((op) => op.reminderId))];
+    let existing = [];
+    let loadFailed = false;
+    try {
+      existing = await getRemindersByIds(ids);
+    } catch {
+      loadFailed = true;
+    }
+    const byId = new Map(existing.map((row) => [row.id, row]));
+
+    for (const op of updates) {
+      if (loadFailed) {
+        results.push({
+          requested: op,
+          applied: false,
+          userMessage: "I couldn’t update that reminder right now."
+        });
+        continue;
+      }
+
+      const current = byId.get(op.reminderId);
+      if (!current || current.status !== REMINDER_STATUS.pending) {
+        results.push({
+          requested: op,
+          applied: false,
+          userMessage: "That reminder isn’t active anymore."
+        });
+        continue;
+      }
+
+      let update;
+      try {
+        update = buildReminderUpdate(op, current, { now, timeZone });
+      } catch (err) {
+        results.push({ requested: op, applied: false, userMessage: reminderFailureMessage(err) });
+        continue;
+      }
+
+      try {
+        const applied = await updatePendingReminder(op.reminderId, update.payload);
+        results.push({
+          requested: op,
+          applied,
+          userMessage: applied
+            ? buildReminderScheduleMessage(update.resolved, {
+                timeZone,
+                now,
+                lead: "Updated that reminder. I’ll remind you",
+                nextLabel: "Next one"
+              })
+            : "That reminder isn’t active anymore."
+        });
+      } catch {
+        results.push({
+          requested: op,
+          applied: false,
+          userMessage: "I couldn’t update that reminder right now."
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
 async function applySettingOperation(operation, allowSettings) {
   if (!allowSettings) {
     return {
@@ -944,9 +1679,14 @@ async function applySettingOperation(operation, allowSettings) {
   }
 }
 
-async function applyUserOperations(operations, { allowSettings }) {
+async function applyUserOperations(operations, { allowSettings, chatId, now }) {
   const taskOperations = operations.filter((op) => TASK_OPERATIONS.has(op.operation));
+  const reminderOperations = operations.filter((op) => REMINDER_OPERATIONS.has(op.operation));
   const results = await applyTaskOperations(taskOperations);
+
+  if (reminderOperations.length) {
+    results.push(...(await applyReminderOperations(reminderOperations, { chatId, now })));
+  }
 
   for (const operation of operations) {
     if (operation.operation === "set_setting") {
@@ -962,31 +1702,41 @@ async function applyUserOperations(operations, { allowSettings }) {
   return results;
 }
 
+/** Operations whose user-facing line comes from Node rather than from Claude's prose. */
+function hasDeterministicMessage(operation) {
+  return (
+    operation === "set_setting" || operation === "invalid" || REMINDER_OPERATIONS.has(operation)
+  );
+}
+
 function buildUserQueryMessage(parsedMessage, operations, results) {
   const taskOperations = operations.filter((op) => TASK_OPERATIONS.has(op.operation));
-  const settingLikeOperations = operations.filter(
-    (op) => op.operation === "set_setting" || op.operation === "invalid"
-  );
+  const deterministicOperations = operations.filter((op) => hasDeterministicMessage(op.operation));
   const taskResults = results.filter((result) => TASK_OPERATIONS.has(result?.requested?.operation));
   const parts = [];
 
   if (taskOperations.length) {
     parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(taskResults));
-  } else if (!settingLikeOperations.length) {
+  } else if (!deterministicOperations.length) {
     parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(results));
   }
 
   for (const result of results) {
-    if (
-      (result?.requested?.operation === "set_setting" ||
-        result?.requested?.operation === "invalid") &&
-      result.userMessage
-    ) {
+    if (hasDeterministicMessage(result?.requested?.operation) && result.userMessage) {
       parts.push(result.userMessage);
     }
   }
 
   return parts.filter(Boolean).join("\n");
+}
+
+function reminderSnapshotPayload(reminders, { timeZone, now }) {
+  return reminders.map((row) => ({
+    id: row.id,
+    body: row.body,
+    repeats: row.recurrence ? describeRecurrence(row.recurrence) : null,
+    next: formatZonedDayTime(new Date(row.next_due_at), timeZone, now)
+  }));
 }
 
 function settingsPromptPayload() {
@@ -1049,7 +1799,17 @@ const SUBMIT_OPERATIONS_TOOL = Object.freeze({
           properties: {
             operation: {
               type: "string",
-              enum: ["create", "update", "delete", "complete", "push", "set_setting"]
+              enum: [
+                "create",
+                "update",
+                "delete",
+                "complete",
+                "push",
+                "set_setting",
+                "create_reminder",
+                "update_reminder",
+                "cancel_reminder"
+              ]
             },
             targetId: {
               anyOf: [{ type: "string" }, { type: "null" }]
@@ -1058,7 +1818,48 @@ const SUBMIT_OPERATIONS_TOOL = Object.freeze({
             urgency: { type: "number" },
             duration: { type: "number" },
             key: { type: "string" },
-            value: {}
+            value: {},
+            reminderId: {
+              anyOf: [{ type: "string" }, { type: "null" }],
+              description: "Existing reminder id for update_reminder and cancel_reminder."
+            },
+            body: {
+              type: "string",
+              description:
+                'What to remind the user about, as a short second-person action phrase such as "call your dad".'
+            },
+            dueLocal: {
+              type: "string",
+              description:
+                'One-time reminder wall-clock time in the active timezone, formatted "YYYY-MM-DDTHH:MM". Never a UTC timestamp.'
+            },
+            inMinutes: {
+              type: "number",
+              description: 'Relative delay in minutes for a one-time reminder such as "in 20 minutes".'
+            },
+            recurrence: {
+              type: "object",
+              description: "Repeating schedule for a reminder. Omit for a one-time reminder.",
+              properties: {
+                freq: { type: "string", enum: ["daily", "weekly", "monthly", "yearly"] },
+                interval: { type: "number", description: "Repeat every N units. Defaults to 1." },
+                byWeekday: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Required for weekly. 0 is Sunday through 6 is Saturday."
+                },
+                byMonthDay: {
+                  type: "number",
+                  description: "Required for monthly and yearly. 1-31."
+                },
+                month: { type: "number", description: "Required for yearly. 1-12." },
+                hour: { type: "number", description: "Required. Local hour, 0-23." },
+                minute: { type: "number", description: "Local minute, 0-59. Defaults to 0." },
+                until: { type: "string", description: 'Optional last local date, "YYYY-MM-DD".' },
+                count: { type: "number", description: "Optional total number of occurrences." }
+              },
+              required: ["freq", "hour"]
+            }
           },
           required: ["operation"]
         }
@@ -1166,12 +1967,17 @@ async function requestClaudeUserQuery({ messages, tools, toolChoice }) {
 async function processUserQuery(query, { allowSettings, chatId }) {
   const allowHistory = isOwnerChat(chatId);
   const now = new Date();
+  const timeZone = getActiveTimeZone();
   const taskDayStart = getReminderDayStartUtc(now);
-  const currentTasks = await listTasksForUserQuery();
+  // One round trip each, in parallel: neither snapshot depends on the other.
+  const [currentTasks, pendingReminders] = await Promise.all([
+    listTasksForUserQuery(),
+    listPendingReminders()
+  ]);
   const prompt = [
     "You are an operation parser for a personal task assistant named Tod.",
     `Always finish by calling ${SUBMIT_OPERATIONS_TOOL_NAME}. Never answer with a plain text response.`,
-    'operation must be one of: "create" | "update" | "delete" | "complete" | "push" | "set_setting".',
+    'operation must be one of: "create" | "update" | "delete" | "complete" | "push" | "set_setting" | "create_reminder" | "update_reminder" | "cancel_reminder".',
     "Return one operation per requested change. Multiple operations are allowed in one response.",
     'Use "create" for new tasks, "update" to change title/urgency/duration, "delete" when the user abandons a task (not doing it — maps to cancelled),',
     '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am in the active timezone).',
@@ -1181,14 +1987,26 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     "Urgency must be 1-10, duration in minutes.",
     "For update, title/urgency/duration are optional; omit or set null to keep the current value.",
     "For delete, complete, and push, title/urgency/duration are ignored.",
+    "",
+    'Use "create_reminder" when the user asks to be reminded at a clock time, on a date, after a delay, or on a repeating schedule.',
+    "Reminders are timed messages and are completely separate from tasks: never also create, update, or complete a task for the same reminder request, and never create a reminder for a plain task request.",
+    'Set body to a short second-person action phrase with no "remind me" wording, so "remind me to call my dad" has body "call your dad".',
+    'For a one-time reminder set dueLocal to a local wall-clock time formatted "YYYY-MM-DDTHH:MM" in the active timezone, or set inMinutes for a relative delay such as "in 20 minutes". Never send a UTC timestamp and never apply an offset yourself.',
+    "For a repeating reminder set recurrence and omit dueLocal. hour is required. weekly requires byWeekday, monthly requires byMonthDay, yearly requires month and byMonthDay.",
+    'Resolve vague times as morning 09:00, afternoon 13:00, evening 19:00, night 21:00. If a bare clock time already passed today, still send today’s date; the server moves it to the next day.',
+    "Repeating schedules finer than daily (every minute, hourly) are not supported: return no operation for that request and say so.",
+    "If the user asks to be reminded but gives no clock time, date, delay, or repeating schedule, return no operation and ask what time they want it. Do not guess a time and do not turn it into a task.",
+    'Use "cancel_reminder" to stop a reminder and "update_reminder" to change its wording or time. reminderId must be the id of a reminder in the pending reminder snapshot. Canceling a repeating reminder cancels the whole series.',
+    "",
     'Use "set_setting" when the user asks to change a supported bot preference. Set key to an exact supported setting key and value to its new value.',
     'For timezone, translate phrases such as "Eastern time" to an IANA timezone such as "America/New_York".',
     "Never turn a request to change Tod’s behavior into a task. If the requested behavior is not a supported setting, return no operation for it and explain that limitation in message.",
     "There are no slash commands. Treat every user message as natural language, including Telegram slash-style text such as /start or /list.",
     "Do not create a task from slash-looking text unless the user is clearly adding a task. Help, /start, listing tasks, reading current settings, and canceling every open task are ordinary requests: empty operations for read-only answers, or one delete per currently open task when they ask to clear or cancel them all.",
     "",
-    `Current time: ${now.toISOString()}.`,
-    `Active timezone: ${getActiveTimeZone()}.`,
+    `Current local time: ${formatZonedFull(now, timeZone)} (${timeZone}).`,
+    `Current time in UTC: ${now.toISOString()}.`,
+    "Resolve every time the user mentions against the current local time above, and express reminder times in that same local wall clock.",
     `The current task day began at ${taskDayStart.toISOString()} (05:00 local). Interpret “today” using this boundary.`,
     "created_at is when a task was first added. updated_at is its latest mutation. Use these structured timestamps for task-date questions without searching conversation history.",
     "For a row currently completed, canceled, or pushed, updated_at is when that current status was applied because non-open rows cannot be changed again before rollover.",
@@ -1196,6 +2014,7 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     "",
     'Also include a user-facing "message" string that summarizes task changes or answers in friendly natural language.',
     'Do not claim that a setting changed in "message"; the server will confirm setting results after validating and saving them. For a setting-only request, use an empty message.',
+    'Never state or restate a reminder time in "message", and never claim a reminder was created, changed, or canceled; the server confirms reminders with the time it actually stored. For a reminder-only request, use an empty message.',
     'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
     'In "message", never include urgency, duration, task ids, or any numeric or internal metadata.',
     'Write "message" in natural conversational prose: use each task’s meaning, weave it into full sentences the way you would in speech, and paraphrase freely; do not recite or quote the stored task titles verbatim.',
@@ -1215,6 +2034,7 @@ async function processUserQuery(query, { allowSettings, chatId }) {
       : []),
     "",
     `Task snapshot: ${JSON.stringify(currentTasks)}`,
+    `Pending reminder snapshot: ${JSON.stringify(reminderSnapshotPayload(pendingReminders, { timeZone, now }))}`,
     `Supported settings: ${JSON.stringify(settingsPromptPayload())}`,
     `User request: ${query}`
   ].join("\n");
@@ -1280,9 +2100,9 @@ async function processUserQuery(query, { allowSettings, chatId }) {
 
   let operations;
   try {
-    if (typeof toolUse.input?.message !== "string") {
-      throw new Error("Claude submission did not include a message string.");
-    }
+    // A missing message is recoverable: setting and reminder replies are written by Node
+    // anyway, and task replies fall back to a deterministic summary. Only a missing
+    // operations array is fatal, which normalizeOperationListPayload still rejects.
     operations = normalizeOperationListPayload(toolUse.input);
   } catch (error) {
     throw taskError("I couldn’t understand the assistant response.", {
@@ -1294,9 +2114,9 @@ async function processUserQuery(query, { allowSettings, chatId }) {
     });
   }
 
-  const results = await applyUserOperations(operations, { allowSettings });
+  const results = await applyUserOperations(operations, { allowSettings, chatId, now });
   return {
-    message: buildUserQueryMessage(toolUse.input.message, operations, results)
+    message: buildUserQueryMessage(toolUse.input?.message, operations, results)
   };
 }
 
@@ -1338,6 +2158,41 @@ function formatZonedClock(date, timeZone = getActiveTimeZone()) {
     minute: "2-digit",
     hourCycle: "h23",
     timeZoneName: "short"
+  }).format(date);
+}
+
+/** Reminder-facing wording: "today at 2:00 PM", "tomorrow at 8:00 AM", "Mon, Aug 24 at 9:00 AM". */
+function formatZonedDayTime(date, timeZone = getActiveTimeZone(), now = new Date()) {
+  const target = getZonedParts(date, timeZone);
+  const today = getZonedParts(now, timeZone);
+  const dayOffset = daysBetweenLocalDates(toLocalDate(today), toLocalDate(target));
+  const clock = formatLocalClock(target.hour, target.minute);
+
+  if (dayOffset === 0) return `today at ${clock}`;
+  if (dayOffset === 1) return `tomorrow at ${clock}`;
+  if (dayOffset === -1) return `yesterday at ${clock}`;
+
+  const dateLabel = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    ...(target.year === today.year ? {} : { year: "numeric" })
+  }).format(date);
+  return `${dateLabel} at ${clock}`;
+}
+
+/** The prompt needs local wall clock; Claude should never do UTC conversion itself. */
+function formatZonedFull(date, timeZone = getActiveTimeZone()) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
   }).format(date);
 }
 
@@ -1402,7 +2257,7 @@ async function telegramSendInteractiveReply({
 async function persistScheduledChatMessage(kind, content) {
   try {
     await insertScheduledChatMessage({
-      chatId: config.reminderChatId,
+      chatId: config.ownerChatId,
       kind,
       content,
       createdAt: new Date().toISOString()
@@ -1565,7 +2420,7 @@ async function runNightlyDigest() {
 
   const text = buildNightlyDigestText({ open, completed, canceled });
   try {
-    await telegramSendMessage(config.reminderChatId, text);
+    await telegramSendMessage(config.ownerChatId, text);
     await persistScheduledChatMessage("digest", text);
   } catch (err) {
     console.error("Nightly digest: Telegram send failed:", err instanceof Error ? err.message : err);
@@ -1610,7 +2465,7 @@ async function runMorningMessage() {
   }
 
   try {
-    await telegramSendMessage(config.reminderChatId, text);
+    await telegramSendMessage(config.ownerChatId, text);
     await persistScheduledChatMessage("morning", text);
   } catch (err) {
     console.error("Morning message: Telegram send failed:", err instanceof Error ? err.message : err);
@@ -1759,6 +2614,66 @@ async function runDailyRollover() {
       err instanceof Error ? err.message : err
     );
   }
+
+  // Only finished reminders age out. A pending reminder can be weeks away and must never
+  // be swept up the way clearAllNudgeSends deletes its whole table.
+  try {
+    await deleteTerminalRemindersOlderThan(
+      new Date(Date.now() - REMINDER_RETENTION_MS).toISOString()
+    );
+  } catch (err) {
+    console.error(
+      "Daily rollover: failed to delete expired reminders:",
+      err instanceof Error ? err.message : err
+    );
+  }
+}
+
+/**
+ * A recurring reminder follows the local wall clock, so its cached next_due_at has to be
+ * recomputed when the timezone changes. One-off reminders keep their absolute instant.
+ */
+async function rescheduleRecurringReminders(timeZone) {
+  const rows = await listLiveRecurringReminders();
+  if (!rows.length) return 0;
+
+  const now = new Date();
+  let moved = 0;
+
+  for (const row of rows) {
+    let recurrence;
+    try {
+      recurrence = normalizeRecurrence(row.recurrence);
+    } catch {
+      continue;
+    }
+
+    // Computing from `now` also clamps forward: moving Eastern to Pacific shifts an 8am
+    // series backwards in absolute terms, which would otherwise fire it immediately.
+    const next = computeNextOccurrence(recurrence, {
+      after: now,
+      timeZone,
+      anchor: new Date(row.created_at)
+    });
+
+    try {
+      const changed = await markReminder(
+        row.id,
+        next
+          ? { next_due_at: next.toISOString(), time_zone: timeZone }
+          : { status: REMINDER_STATUS.exhausted, time_zone: timeZone },
+        { requireStatus: row.status }
+      );
+      if (changed) moved++;
+    } catch (err) {
+      console.error(
+        `Reminder ${row.id}: failed to reschedule for ${timeZone}:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
+  return moved;
 }
 
 async function runNudgeTick() {
@@ -1831,7 +2746,7 @@ async function runNudgeTick() {
   }
 
   try {
-    await telegramSendMessage(config.reminderChatId, message);
+    await telegramSendMessage(config.ownerChatId, message);
   } catch (err) {
     debug("Telegram send failed:", err instanceof Error ? err.message : err);
     return;
@@ -1844,6 +2759,138 @@ async function runNudgeTick() {
   }
 
   await persistScheduledChatMessage("nudge", message);
+}
+
+async function sendReminderMessage(row) {
+  const text = `Reminder: ${row.body}`;
+  await telegramSendMessage(row.chat_id, text);
+  // persistScheduledChatMessage always writes as the owner, so only call it for the owner.
+  if (isOwnerChat(row.chat_id)) await persistScheduledChatMessage("reminder", text);
+}
+
+async function fireOneOffReminder(row, { debug }) {
+  // Claim before sending: with one process and a single-flight tick this is what makes
+  // delivery once-only, instead of the nudge log's send-then-record race.
+  const claimed = await updatePendingReminder(row.id, { status: REMINDER_STATUS.sending });
+  if (!claimed) {
+    debug("Skipped, no longer pending:", row.id);
+    return;
+  }
+
+  try {
+    await sendReminderMessage(row);
+  } catch (err) {
+    const attempts = Number(row.attempts || 0) + 1;
+    const givingUp = attempts >= REMINDER_MAX_SEND_ATTEMPTS;
+    console.error(
+      `Reminder ${row.id}: send failed on attempt ${attempts}${givingUp ? " (giving up)" : ""}:`,
+      err instanceof Error ? err.message : err
+    );
+    await markReminder(
+      row.id,
+      { status: givingUp ? REMINDER_STATUS.failed : REMINDER_STATUS.pending, attempts },
+      { requireStatus: REMINDER_STATUS.sending }
+    );
+    return;
+  }
+
+  await markReminder(row.id, {
+    status: REMINDER_STATUS.sent,
+    occurrences_sent: Number(row.occurrences_sent || 0) + 1,
+    last_fired_at: new Date().toISOString()
+  });
+}
+
+async function fireRecurringReminder(row, { now, timeZone, debug }) {
+  const anchor = new Date(row.created_at);
+  let recurrence;
+  try {
+    recurrence = normalizeRecurrence(row.recurrence);
+  } catch (err) {
+    console.error(
+      `Reminder ${row.id}: stored recurrence is invalid; marking failed:`,
+      err instanceof Error ? err.message : err
+    );
+    await updatePendingReminder(row.id, { status: REMINDER_STATUS.failed });
+    return;
+  }
+
+  // next_due_at is a cache of the rule. If a timezone recompute failed, rezone and wait
+  // rather than firing at the old zone's wall clock.
+  if (row.time_zone !== timeZone) {
+    const rezoned = computeNextOccurrence(recurrence, { after: now, timeZone, anchor });
+    if (rezoned) {
+      await updatePendingReminder(row.id, {
+        next_due_at: rezoned.toISOString(),
+        time_zone: timeZone
+      });
+      debug("Rezoned instead of firing:", row.id, rezoned.toISOString());
+      return;
+    }
+  }
+
+  const occurrencesSent = Number(row.occurrences_sent || 0) + 1;
+  const reachedCount = Boolean(recurrence.count) && occurrencesSent >= recurrence.count;
+  const next = reachedCount
+    ? null
+    : computeNextOccurrence(recurrence, { after: now, timeZone, anchor });
+
+  // Advance first: a crash then costs one message instead of leaving a row that re-fires
+  // every tick. Stepping straight to the next future occurrence is also what keeps a
+  // multi-day outage from delivering one message per missed occurrence.
+  const advanced = await updatePendingReminder(row.id, {
+    ...(next
+      ? { next_due_at: next.toISOString() }
+      : { status: REMINDER_STATUS.exhausted }),
+    occurrences_sent: occurrencesSent,
+    last_fired_at: now.toISOString(),
+    time_zone: timeZone
+  });
+  if (!advanced) {
+    debug("Skipped, no longer pending:", row.id);
+    return;
+  }
+
+  await sendReminderMessage(row);
+}
+
+/**
+ * Explicit reminders deliberately ignore every nudge gate: no send window, no daily cap,
+ * no cooldown, and no calendar-busy suppression. The user asked for this message at this
+ * time, so second-guessing it would be the wrong kind of helpful.
+ */
+async function runReminderTick() {
+  const now = new Date();
+  const debug = (...args) => {
+    if (config.debug) console.log("[reminder]", ...args);
+  };
+
+  let due;
+  try {
+    due = await listDueReminders(now.toISOString());
+  } catch (err) {
+    console.error(
+      "Reminder tick: failed to load due reminders:",
+      err instanceof Error ? err.message : err
+    );
+    return;
+  }
+  if (!due.length) return;
+
+  const timeZone = getActiveTimeZone();
+  debug("Due reminders:", due.length);
+
+  for (const row of due) {
+    try {
+      if (row.recurrence) await fireRecurringReminder(row, { now, timeZone, debug });
+      else await fireOneOffReminder(row, { debug });
+    } catch (err) {
+      console.error(
+        `Reminder ${row.id}: delivery failed:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
 }
 
 const inFlightJobs = new Set();
@@ -1880,7 +2927,13 @@ const SCHEDULED_JOBS = [
     run: runNudgeTick,
     note: "every 10 minutes (12:00–22:00 local, ≥30 min free gap, caps + cooldown enforced)"
   },
-  { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 local" }
+  { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 local" },
+  {
+    name: "Reminders",
+    expression: "* * * * *",
+    run: runReminderTick,
+    note: "every minute (deliver due reminders; no nudge gating)"
+  }
 ];
 
 let scheduledJobHandles = [];
@@ -1930,6 +2983,17 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function main() {
   await loadRuntimeSettings();
+
+  try {
+    const reclaimed = await reclaimStuckReminders();
+    if (reclaimed) console.log(`Reclaimed ${reclaimed} reminder(s) interrupted mid-send.`);
+  } catch (err) {
+    console.error(
+      "Startup: failed to reclaim interrupted reminders:",
+      err instanceof Error ? err.message : err
+    );
+  }
+
   startScheduledJobs();
   startTelegramPolling();
 }
