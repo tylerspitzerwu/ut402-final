@@ -1,10 +1,11 @@
 "use strict";
 
 /**
- * Env (see .gitignore for .env):
- * - ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (required for tasks)
- * - CLAUDE_MODEL, DEBUG
- * - TELEGRAM_BOT_TOKEN: required; server long-polls Telegram getUpdates for this bot.
+ * Personal Telegram task assistant. See AGENTS.md for product rules and deployment.
+ *
+ * Every required environment variable is validated in buildConfig() at boot, so a missing
+ * credential fails the process immediately instead of at the next scheduled job.
+ * Optional: CLAUDE_MODEL, DEBUG.
  */
 
 require("dotenv").config();
@@ -12,78 +13,83 @@ require("dotenv").config();
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
-
 const TELEGRAM_MAX_MESSAGE_LEN = 4096;
 const AMERICA_LOS_ANGELES_TZ = "America/Los_Angeles";
 /** Minutes of free time until the next busy block (or horizon) required before sending a reminder. */
 const MIN_FREE_GAP_MINUTES_FOR_REMINDER = 30;
+/** How far ahead to look for busy blocks. Every gate compares against <= 30 minutes. */
+const CALENDAR_HORIZON_HOURS = 6;
 
-function getApiKey() {
-  const key = String(process.env.ANTHROPIC_API_KEY || "").trim();
-  if (!key) {
-    throw new Error("Missing ANTHROPIC_API_KEY in environment.");
-  }
-  return key;
+/** Per-destination request timeouts. The long poll needs headroom over its own timeout=50. */
+const TIMEOUT_MS = {
+  anthropic: 20000,
+  google: 10000,
+  telegram: 10000,
+  telegramPoll: 55000
+};
+
+function requireEnv(name) {
+  const value = String(process.env[name] || "").trim();
+  if (!value) throw new Error(`Missing ${name} in environment.`);
+  return value;
 }
 
-function getGoogleConfig() {
-  const clientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
-  const clientSecret = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
-  const refreshToken = String(process.env.GOOGLE_REFRESH_TOKEN || "").trim();
-  const calendarIdsRaw = String(process.env.GOOGLE_CALENDAR_IDS || "").trim();
-
-  if (!clientId) throw new Error("Missing GOOGLE_CLIENT_ID in environment.");
-  if (!clientSecret) throw new Error("Missing GOOGLE_CLIENT_SECRET in environment.");
-  if (!refreshToken) throw new Error("Missing GOOGLE_REFRESH_TOKEN in environment.");
-  if (!calendarIdsRaw) throw new Error("Missing GOOGLE_CALENDAR_IDS in environment.");
-
-  const calendarIds = calendarIdsRaw
+/**
+ * Reads and validates every required variable once, at boot. Without this a missing
+ * Google credential would not surface until the first midday reminder tick.
+ */
+function buildConfig() {
+  const calendarIds = requireEnv("GOOGLE_CALENDAR_IDS")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
   if (!calendarIds.length) throw new Error("GOOGLE_CALENDAR_IDS was empty.");
 
-  return { clientId, clientSecret, refreshToken, calendarIds };
+  const chatIdRaw = requireEnv("TELEGRAM_CHAT_ID");
+  const chatIdNum = Number(chatIdRaw);
+
+  return Object.freeze({
+    anthropicApiKey: requireEnv("ANTHROPIC_API_KEY"),
+    claudeModel: process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001",
+    supabaseUrl: requireEnv("SUPABASE_URL"),
+    supabaseKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    telegramBotToken: requireEnv("TELEGRAM_BOT_TOKEN"),
+    reminderChatId: Number.isFinite(chatIdNum) ? chatIdNum : chatIdRaw,
+    google: Object.freeze({
+      clientId: requireEnv("GOOGLE_CLIENT_ID"),
+      clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
+      refreshToken: requireEnv("GOOGLE_REFRESH_TOKEN"),
+      calendarIds: Object.freeze(calendarIds)
+    }),
+    debug: String(process.env.DEBUG || "").toLowerCase() === "true"
+  });
 }
 
-function getSupabaseConfig() {
-  const url = String(process.env.SUPABASE_URL || "").trim();
-  const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
-  if (!url) throw new Error("Missing SUPABASE_URL in environment.");
-  if (!key) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY in environment.");
-  return { url, key };
-}
+const config = buildConfig();
 
-const supabase = (() => {
-  const { url, key } = getSupabaseConfig();
-  return createClient(url, key);
-})();
+const supabase = createClient(config.supabaseUrl, config.supabaseKey);
+
+/** Every outbound request goes through here so nothing can hang the single-threaded loop. */
+function fetchWithTimeout(url, options, timeoutMs) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+}
 
 function buildDebugPayload(payload) {
-  const enabled = String(process.env.DEBUG || "").toLowerCase() === "true";
-  return enabled ? payload : undefined;
+  return config.debug ? payload : undefined;
 }
 
-function httpTaskError(status, errorMessage, debugDetails) {
+function taskError(errorMessage, debugDetails) {
   const err = new Error(errorMessage);
-  err.status = status;
   err.body = { error: errorMessage, debug: buildDebugPayload(debugDetails) };
   return err;
 }
 
-function getTelegramBotToken() {
-  return String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
-}
+const zonedPartsFormatters = new Map();
 
-function getReminderChatId() {
-  const raw = String(process.env.TELEGRAM_CHAT_ID || "").trim();
-  if (!raw) throw new Error("Missing TELEGRAM_CHAT_ID in environment.");
-  const asNum = Number(raw);
-  return Number.isFinite(asNum) ? asNum : raw;
-}
-
-function getZonedParts(date, timeZone) {
+/** Constructing a DateTimeFormat is the expensive half of Intl; formatting with one is cheap. */
+function getZonedPartsFormatter(timeZone) {
+  const cached = zonedPartsFormatters.get(timeZone);
+  if (cached) return cached;
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone,
     year: "numeric",
@@ -94,7 +100,12 @@ function getZonedParts(date, timeZone) {
     second: "2-digit",
     hour12: false
   });
-  const parts = dtf.formatToParts(date);
+  zonedPartsFormatters.set(timeZone, dtf);
+  return dtf;
+}
+
+function getZonedParts(date, timeZone) {
+  const parts = getZonedPartsFormatter(timeZone).formatToParts(date);
   const out = {};
   for (const p of parts) {
     if (p.type !== "literal") out[p.type] = p.value;
@@ -156,15 +167,12 @@ function isWithinEtSendWindow(now = new Date()) {
 
 function getReminderDayStartEtUtc(now = new Date()) {
   const p = getZonedParts(now, AMERICA_LOS_ANGELES_TZ);
-  const isBefore5am = p.hour < 5 || (p.hour === 5 && (p.minute < 0 || p.second < 0));
-  // Note: minute/second comparisons above are defensive; p.minute/p.second are non-negative.
   const anchor = new Date(now.getTime());
   if (p.hour < 5) {
     // Move to previous day in PT by subtracting 12h (safe) and re-read parts.
     anchor.setTime(anchor.getTime() - 12 * 60 * 60000);
   }
   const a = getZonedParts(anchor, AMERICA_LOS_ANGELES_TZ);
-  void isBefore5am;
   return makeDateInTimeZone(
     { year: a.year, month: a.month, day: a.day, hour: 5, minute: 0, second: 0 },
     AMERICA_LOS_ANGELES_TZ
@@ -172,24 +180,43 @@ function getReminderDayStartEtUtc(now = new Date()) {
 }
 
 async function fetchGoogleAccessToken() {
-  const { clientId, clientSecret, refreshToken } = getGoogleConfig();
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token"
-    }).toString()
-  });
+  const { clientId, clientSecret, refreshToken } = config.google;
+  const response = await fetchWithTimeout(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token"
+      }).toString()
+    },
+    TIMEOUT_MS.google
+  );
   const json = await response.json().catch(() => ({}));
   if (!response.ok || typeof json?.access_token !== "string") {
     throw new Error(
       `Google token refresh failed: ${response.status} ${JSON.stringify(json).slice(0, 500)}`
     );
   }
-  return { accessToken: json.access_token, expiresIn: json.expires_in };
+  return { accessToken: json.access_token, expiresIn: Number(json.expires_in) || 3600 };
+}
+
+let cachedGoogleToken = null;
+
+/** Access tokens last about an hour; refreshing on every tick was a wasted round trip. */
+async function getGoogleAccessToken() {
+  if (cachedGoogleToken && cachedGoogleToken.expiresAt > Date.now()) {
+    return cachedGoogleToken.accessToken;
+  }
+  const { accessToken, expiresIn } = await fetchGoogleAccessToken();
+  cachedGoogleToken = {
+    accessToken,
+    expiresAt: Date.now() + Math.max(0, expiresIn - 300) * 1000
+  };
+  return accessToken;
 }
 
 function parseGoogleEventBusyInterval(ev) {
@@ -234,39 +261,59 @@ function mergeIntervals(intervals) {
   return out;
 }
 
-async function fetchCalendarBusyIntervals({ timeMin, timeMax }) {
-  const { calendarIds } = getGoogleConfig();
-  const { accessToken } = await fetchGoogleAccessToken();
-  const intervals = [];
+/** Only the fields parseGoogleEventBusyInterval actually reads. */
+const CALENDAR_FIELDS_MASK = "nextPageToken,items(status,start,end,attendees(self,responseStatus))";
 
-  for (const calId of calendarIds) {
+async function fetchCalendarIntervals({ calendarId, accessToken, timeMin, timeMax }) {
+  const intervals = [];
+  let pageToken;
+
+  do {
     const url = new URL(
-      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`
     );
     url.searchParams.set("timeMin", timeMin.toISOString());
     url.searchParams.set("timeMax", timeMax.toISOString());
     url.searchParams.set("singleEvents", "true");
     url.searchParams.set("orderBy", "startTime");
-    url.searchParams.set("maxResults", "2500");
+    url.searchParams.set("maxResults", "250");
+    url.searchParams.set("fields", CALENDAR_FIELDS_MASK);
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
 
-    const resp = await fetch(url.toString(), {
-      method: "GET",
-      headers: { authorization: `Bearer ${accessToken}` }
-    });
+    const resp = await fetchWithTimeout(
+      url.toString(),
+      { method: "GET", headers: { authorization: `Bearer ${accessToken}` } },
+      TIMEOUT_MS.google
+    );
     const json = await resp.json().catch(() => ({}));
     if (!resp.ok) {
+      // A token can be revoked before it expires; drop it so the next tick refreshes.
+      if (resp.status === 401) cachedGoogleToken = null;
       throw new Error(
-        `Google Calendar events fetch failed for ${calId}: ${resp.status} ${JSON.stringify(json).slice(0, 500)}`
+        `Google Calendar events fetch failed for ${calendarId}: ${resp.status} ${JSON.stringify(json).slice(0, 500)}`
       );
     }
+
     const items = Array.isArray(json?.items) ? json.items : [];
     for (const ev of items) {
       const interval = parseGoogleEventBusyInterval(ev);
       if (interval) intervals.push(interval);
     }
-  }
 
-  return mergeIntervals(intervals);
+    pageToken = typeof json?.nextPageToken === "string" ? json.nextPageToken : undefined;
+  } while (pageToken);
+
+  return intervals;
+}
+
+async function fetchCalendarBusyIntervals({ timeMin, timeMax }) {
+  const accessToken = await getGoogleAccessToken();
+  const perCalendar = await Promise.all(
+    config.google.calendarIds.map((calendarId) =>
+      fetchCalendarIntervals({ calendarId, accessToken, timeMin, timeMax })
+    )
+  );
+  return mergeIntervals(perCalendar.flat());
 }
 
 function computeCurrentFreeGap({ now, busyIntervals, horizonEnd }) {
@@ -419,10 +466,13 @@ function normalizeOperationPayload(raw) {
   };
 }
 
+/** Columns every task consumer needs. Ordering by created_at does not require selecting it. */
+const TASK_COLUMNS = "id,title,urgency,duration";
+
 async function listTasksByStatus(status) {
   const { data, error } = await supabase
     .from("tasks")
-    .select("id,title,urgency,duration,status,created_at,updated_at")
+    .select(TASK_COLUMNS)
     .eq("status", status)
     .order("created_at", { ascending: false });
 
@@ -436,41 +486,50 @@ async function listOpenTasks() {
   return listTasksByStatus("open");
 }
 
-async function countRemindersSince(iso) {
-  const { count, error } = await supabase
-    .from("reminders")
-    .select("id", { count: "exact", head: true })
-    .gte("created_at", iso);
-  if (error) throw new Error(`Supabase count reminders failed: ${error.message}`);
-  return Number(count || 0);
+/** One round trip for several statuses at once, grouped in memory. */
+async function listTasksGroupedByStatus(statuses) {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select(`${TASK_COLUMNS},status`)
+    .in("status", statuses)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    throw new Error(`Supabase list tasks failed: ${error.message}`);
+  }
+
+  const grouped = Object.fromEntries(statuses.map((status) => [status, []]));
+  for (const row of Array.isArray(data) ? data : []) {
+    grouped[row?.status]?.push(row);
+  }
+  return grouped;
 }
 
-async function getMostRecentReminder() {
+/**
+ * One query answers both reminder gates. Looking only at today is safe for the cooldown:
+ * the send window opens at 12:00 PT, so any reminder from a previous day is already
+ * hours past the 120-minute cooldown.
+ */
+async function listRemindersSince(iso) {
   const { data, error } = await supabase
     .from("reminders")
-    .select("id,created_at,task_ids")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (error) throw new Error(`Supabase last reminder failed: ${error.message}`);
-  return data || null;
+    .select("created_at")
+    .gte("created_at", iso)
+    .order("created_at", { ascending: false });
+  if (error) throw new Error(`Supabase list reminders failed: ${error.message}`);
+  return Array.isArray(data) ? data : [];
 }
 
 async function insertReminder(taskIds) {
-  const payload = {
-    task_ids: Array.isArray(taskIds) ? taskIds : []
-  };
-  const { data, error } = await supabase
+  const { error } = await supabase
     .from("reminders")
-    .insert(payload)
-    .select("id,created_at,task_ids")
-    .single();
+    .insert({ task_ids: Array.isArray(taskIds) ? taskIds : [] });
   if (error) throw new Error(`Supabase insert reminder failed: ${error.message}`);
-  return data;
 }
 
 async function clearAllReminders() {
-  const { error } = await supabase.from("reminders").delete().gt("id", 0);
+  // Filter is required by PostgREST but must not assume whether id is numeric or a uuid.
+  const { error } = await supabase.from("reminders").delete().not("id", "is", null);
   if (error) throw new Error(`Supabase clear reminders failed: ${error.message}`);
 }
 
@@ -479,19 +538,19 @@ async function canSendReminderNow(now = new Date()) {
 
   const dayStart = getReminderDayStartEtUtc(now);
   const dayStartIso = dayStart.toISOString();
-  const sentToday = await countRemindersSince(dayStartIso);
-  if (sentToday >= 3) return { ok: false, reason: "daily_cap" };
+  const sentToday = await listRemindersSince(dayStartIso);
+  if (sentToday.length >= 3) return { ok: false, reason: "daily_cap" };
 
-  const last = await getMostRecentReminder();
-  if (last?.created_at) {
-    const lastTs = new Date(last.created_at);
+  const lastCreatedAt = sentToday[0]?.created_at;
+  if (lastCreatedAt) {
+    const lastTs = new Date(lastCreatedAt);
     if (Number.isFinite(lastTs.getTime())) {
       const minsSince = (now.getTime() - lastTs.getTime()) / 60000;
       if (minsSince < 120) return { ok: false, reason: "cooldown" };
     }
   }
 
-  return { ok: true, reason: "ok", dayStartIso, sentToday };
+  return { ok: true, reason: "ok", dayStartIso, sentToday: sentToday.length };
 }
 
 async function clearAllOpenTasks() {
@@ -503,13 +562,126 @@ async function clearAllOpenTasks() {
   if (error) {
     throw new Error(error.message);
   }
+}
 
-  const tasks = await listOpenTasks();
-  return { tasks };
+/** Terminal status each non-create, non-update operation moves an open task to. */
+const STATUS_BY_OPERATION = {
+  delete: "canceled",
+  complete: "completed",
+  push: "pushed"
+};
+
+const NOT_OPEN_ERROR = "Task not found or no longer open.";
+
+/**
+ * Applies Claude's operations in as few round trips as possible: one insert for all
+ * creates, one update per destination status, and one update per distinct field payload.
+ * Updates run before status transitions so "rename X and mark it done" applies both.
+ */
+async function applyTaskOperations(operations) {
+  const results = [];
+  const creates = [];
+  const updates = [];
+  const byStatus = new Map();
+
+  for (const op of operations) {
+    if (op.operation === "create") {
+      creates.push(op);
+      continue;
+    }
+
+    if (!isUuid(op.targetId)) {
+      results.push({
+        requested: op,
+        applied: false,
+        error: "Missing or invalid targetId for this operation."
+      });
+      continue;
+    }
+
+    if (op.operation === "update") {
+      updates.push(op);
+      continue;
+    }
+
+    const status = STATUS_BY_OPERATION[op.operation];
+    if (!status) continue;
+    const bucket = byStatus.get(status);
+    if (bucket) bucket.push(op);
+    else byStatus.set(status, [op]);
+  }
+
+  const nowIso = new Date().toISOString();
+
+  if (creates.length) {
+    const { error } = await supabase.from("tasks").insert(
+      creates.map((op) => ({
+        title: op.fields.title,
+        urgency: op.fields.urgency,
+        duration: op.fields.duration,
+        status: "open"
+      }))
+    );
+    for (const op of creates) {
+      results.push({ requested: op, applied: !error, error: error?.message });
+    }
+  }
+
+  for (const op of updates) {
+    const updatePayload = {};
+    if (op.fields.title) updatePayload.title = op.fields.title;
+    if (op.fields.urgency !== undefined) updatePayload.urgency = op.fields.urgency;
+    if (op.fields.duration !== undefined) updatePayload.duration = op.fields.duration;
+
+    if (!Object.keys(updatePayload).length) {
+      results.push({ requested: op, applied: false, error: "No fields provided to update." });
+      continue;
+    }
+
+    updatePayload.updated_at = nowIso;
+
+    const { data, error } = await supabase
+      .from("tasks")
+      .update(updatePayload)
+      .eq("id", op.targetId)
+      .eq("status", "open")
+      .select("id");
+
+    if (error) {
+      results.push({ requested: op, applied: false, error: error.message });
+      continue;
+    }
+
+    const applied = Array.isArray(data) && data.length > 0;
+    results.push({ requested: op, applied, error: applied ? undefined : NOT_OPEN_ERROR });
+  }
+
+  for (const [status, ops] of byStatus) {
+    const ids = [...new Set(ops.map((op) => op.targetId))];
+    const { data, error } = await supabase
+      .from("tasks")
+      .update({ status, updated_at: nowIso })
+      .in("id", ids)
+      .eq("status", "open")
+      .select("id");
+
+    if (error) {
+      for (const op of ops) results.push({ requested: op, applied: false, error: error.message });
+      continue;
+    }
+
+    // Rows the filter did not match were already closed or never existed.
+    const appliedIds = new Set((Array.isArray(data) ? data : []).map((row) => row?.id));
+    for (const op of ops) {
+      const applied = appliedIds.has(op.targetId);
+      results.push({ requested: op, applied, error: applied ? undefined : NOT_OPEN_ERROR });
+    }
+  }
+
+  return results;
 }
 
 async function processTaskQuery(query) {
-  const apiKey = getApiKey();
   const currentTasks = await listOpenTasks();
   const prompt = [
     "You are a task operation parser named Tod.",
@@ -542,22 +714,26 @@ async function processTaskQuery(query) {
 
   let claudeResponse;
   try {
-    claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01"
+    claudeResponse = await fetchWithTimeout(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": config.anthropicApiKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: config.claudeModel,
+          max_tokens: 800,
+          temperature: 0.2,
+          messages: [{ role: "user", content: prompt }]
+        })
       },
-      body: JSON.stringify({
-        model: CLAUDE_MODEL,
-        max_tokens: 800,
-        temperature: 0.2,
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
+      TIMEOUT_MS.anthropic
+    );
   } catch (error) {
-    throw httpTaskError(502, "I couldn’t update your tasks right now.", {
+    throw taskError("I couldn’t update your tasks right now.", {
       type: "anthropic_fetch_failed",
       details:
         error instanceof Error
@@ -568,7 +744,7 @@ async function processTaskQuery(query) {
 
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text();
-    throw httpTaskError(claudeResponse.status, "I couldn’t update your tasks right now.", {
+    throw taskError("I couldn’t update your tasks right now.", {
       type: "anthropic_api_error",
       status: claudeResponse.status,
       details: errorText.slice(0, 2000)
@@ -578,7 +754,7 @@ async function processTaskQuery(query) {
   const data = await claudeResponse.json();
   const textChunk = data?.content?.find((item) => item.type === "text")?.text;
   if (!textChunk) {
-    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+    throw taskError("I couldn’t understand the assistant response.", {
       type: "anthropic_missing_text"
     });
   }
@@ -587,7 +763,7 @@ async function processTaskQuery(query) {
   try {
     parsed = extractJsonPayload(textChunk);
   } catch (error) {
-    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+    throw taskError("I couldn’t understand the assistant response.", {
       type: "anthropic_invalid_json",
       details:
         error instanceof Error
@@ -600,7 +776,7 @@ async function processTaskQuery(query) {
   try {
     operations = normalizeOperationListPayload(parsed);
   } catch (error) {
-    throw httpTaskError(502, "I couldn’t understand the assistant response.", {
+    throw taskError("I couldn’t understand the assistant response.", {
       type: "anthropic_missing_operations",
       details:
         error instanceof Error
@@ -609,125 +785,9 @@ async function processTaskQuery(query) {
     });
   }
 
-  const results = [];
-  for (const op of operations) {
-    if (op.operation === "create") {
-      const { data: row, error } = await supabase
-        .from("tasks")
-        .insert({
-          title: op.fields.title,
-          urgency: op.fields.urgency,
-          duration: op.fields.duration,
-          status: "open"
-        })
-        .select("id,title,urgency,duration,status,created_at,updated_at")
-        .single();
-
-      if (error) {
-        results.push({ requested: op, applied: false, error: error.message });
-        continue;
-      }
-
-      results.push({ requested: op, applied: true, task: row });
-      continue;
-    }
-
-    if (!isUuid(op.targetId)) {
-      results.push({
-        requested: op,
-        applied: false,
-        error: "Missing or invalid targetId for this operation."
-      });
-      continue;
-    }
-
-    if (op.operation === "update") {
-      const updatePayload = {};
-      if (op.fields.title) updatePayload.title = op.fields.title;
-      if (op.fields.urgency !== undefined) updatePayload.urgency = op.fields.urgency;
-      if (op.fields.duration !== undefined) updatePayload.duration = op.fields.duration;
-
-      if (!Object.keys(updatePayload).length) {
-        results.push({
-          requested: op,
-          applied: false,
-          error: "No fields provided to update."
-        });
-        continue;
-      }
-
-      updatePayload.updated_at = new Date().toISOString();
-
-      const { data: row, error } = await supabase
-        .from("tasks")
-        .update(updatePayload)
-        .eq("id", op.targetId)
-        .eq("status", "open")
-        .select("id,title,urgency,duration,status,created_at,updated_at")
-        .single();
-
-      if (error) {
-        results.push({ requested: op, applied: false, error: error.message });
-        continue;
-      }
-
-      results.push({ requested: op, applied: true, task: row });
-    } else if (op.operation === "delete") {
-      const { data: row, error } = await supabase
-        .from("tasks")
-        .update({ status: "canceled", updated_at: new Date().toISOString() })
-        .eq("id", op.targetId)
-        .eq("status", "open")
-        .select("id,title,urgency,duration,status,created_at,updated_at")
-        .single();
-
-      if (error) {
-        results.push({ requested: op, applied: false, error: error.message });
-        continue;
-      }
-
-      results.push({ requested: op, applied: true, task: row });
-    } else if (op.operation === "complete") {
-      const { data: row, error } = await supabase
-        .from("tasks")
-        .update({ status: "completed", updated_at: new Date().toISOString() })
-        .eq("id", op.targetId)
-        .eq("status", "open")
-        .select("id,title,urgency,duration,status,created_at,updated_at")
-        .single();
-
-      if (error) {
-        results.push({ requested: op, applied: false, error: error.message });
-        continue;
-      }
-
-      results.push({ requested: op, applied: true, task: row });
-    } else if (op.operation === "push") {
-      const { data: row, error } = await supabase
-        .from("tasks")
-        .update({ status: "pushed", updated_at: new Date().toISOString() })
-        .eq("id", op.targetId)
-        .eq("status", "open")
-        .select("id,title,urgency,duration,status,created_at,updated_at")
-        .single();
-
-      if (error) {
-        results.push({ requested: op, applied: false, error: error.message });
-        continue;
-      }
-
-      results.push({ requested: op, applied: true, task: row });
-    }
-  }
-
-  const firstApplied = results.find((r) => r.applied);
-  const refreshedTasks = await listOpenTasks();
+  const results = await applyTaskOperations(operations);
   return {
-    message: normalizeMessage(parsed?.message) || buildFallbackMessageFromResults(results),
-    operations: results,
-    tasks: refreshedTasks,
-    operation: firstApplied?.requested?.operation,
-    task: firstApplied?.task
+    message: normalizeMessage(parsed?.message) || buildFallbackMessageFromResults(results)
   };
 }
 
@@ -763,16 +823,16 @@ function splitTelegramText(text) {
 }
 
 async function telegramApi(method, body) {
-  const token = getTelegramBotToken();
-  if (!token) {
-    throw new Error("Missing TELEGRAM_BOT_TOKEN.");
-  }
-  const url = `https://api.telegram.org/bot${token}/${method}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  const url = `https://api.telegram.org/bot${config.telegramBotToken}/${method}`;
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    },
+    TIMEOUT_MS.telegram
+  );
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.ok) {
     const desc = data.description || response.statusText || "Telegram API error";
@@ -792,7 +852,6 @@ async function telegramSendMessage(chatId, text) {
 }
 
 async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
-  const apiKey = getApiKey();
   const gapEndPt = gapEnd ? getZonedParts(gapEnd, AMERICA_LOS_ANGELES_TZ) : null;
   const gapEndStr = gapEndPt
     ? `${String(gapEndPt.hour).padStart(2, "0")}:${String(gapEndPt.minute).padStart(2, "0")} PT`
@@ -821,20 +880,24 @@ async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
     )
   ].join("\n");
 
-  const claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01"
+  const claudeResponse = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": config.anthropicApiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: config.claudeModel,
+        max_tokens: 200,
+        temperature: 0.4,
+        messages: [{ role: "user", content: prompt }]
+      })
     },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 200,
-      temperature: 0.4,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
+    TIMEOUT_MS.anthropic
+  );
 
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text().catch(() => "");
@@ -849,7 +912,6 @@ async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
 }
 
 async function generateMorningCopy({ tasks }) {
-  const apiKey = getApiKey();
   const list = Array.isArray(tasks) ? tasks : [];
   const titles = list
     .map((t) => (typeof t?.title === "string" ? t.title.trim() : ""))
@@ -874,20 +936,24 @@ async function generateMorningCopy({ tasks }) {
     JSON.stringify(titles)
   ].join("\n");
 
-  const claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01"
+  const claudeResponse = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": config.anthropicApiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: config.claudeModel,
+        max_tokens: 220,
+        temperature: 0.6,
+        messages: [{ role: "user", content: prompt }]
+      })
     },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 220,
-      temperature: 0.6,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
+    TIMEOUT_MS.anthropic
+  );
 
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text().catch(() => "");
@@ -935,21 +1001,19 @@ function buildNightlyDigestText({ open, completed, canceled }) {
 }
 
 async function runNightlyDigest() {
-  let open;
-  let completed;
-  let canceled;
+  let grouped;
   try {
-    open = await listOpenTasks();
-    completed = await listTasksByStatus("completed");
-    canceled = await listTasksByStatus("canceled");
+    grouped = await listTasksGroupedByStatus(["open", "completed", "canceled"]);
   } catch (err) {
     console.error("Nightly digest: failed to load tasks:", err instanceof Error ? err.message : err);
     return;
   }
 
+  const { open, completed, canceled } = grouped;
+
   const text = buildNightlyDigestText({ open, completed, canceled });
   try {
-    await telegramSendMessage(getReminderChatId(), text);
+    await telegramSendMessage(config.reminderChatId, text);
   } catch (err) {
     console.error("Nightly digest: Telegram send failed:", err instanceof Error ? err.message : err);
   }
@@ -993,7 +1057,7 @@ async function runMorningMessage() {
   }
 
   try {
-    await telegramSendMessage(getReminderChatId(), text);
+    await telegramSendMessage(config.reminderChatId, text);
   } catch (err) {
     console.error("Morning message: Telegram send failed:", err instanceof Error ? err.message : err);
   }
@@ -1068,42 +1132,54 @@ async function handleTelegramUpdate(update) {
 
 let pollingOffset = 0;
 let pollingActive = false;
+/** Tracked so SIGTERM can let the message being handled finish before exiting. */
+let inFlightDispatch = null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function telegramPollingLoop() {
-  const token = getTelegramBotToken();
-  if (!token || pollingActive) return;
+  if (pollingActive) return;
   pollingActive = true;
+
+  const url = new URL(`https://api.telegram.org/bot${config.telegramBotToken}/getUpdates`);
+  url.searchParams.set("timeout", "50");
+  url.searchParams.set("limit", "10");
+  url.searchParams.set("allowed_updates", JSON.stringify(["message"]));
 
   while (pollingActive) {
     try {
-      const url = new URL(`https://api.telegram.org/bot${token}/getUpdates`);
-      url.searchParams.set("timeout", "50");
       url.searchParams.set("offset", String(pollingOffset));
 
-      const response = await fetch(url.toString(), { method: "GET" });
+      const response = await fetchWithTimeout(
+        url.toString(),
+        { method: "GET" },
+        TIMEOUT_MS.telegramPoll
+      );
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok || !data.ok || !Array.isArray(data.result)) {
-        await new Promise((r) => setTimeout(r, 3000));
+        await sleep(3000);
         continue;
       }
 
       for (const update of data.result) {
+        if (!pollingActive) break;
         pollingOffset = update.update_id + 1;
-        await handleTelegramUpdate(update);
+        inFlightDispatch = handleTelegramUpdate(update);
+        try {
+          await inFlightDispatch;
+        } finally {
+          inFlightDispatch = null;
+        }
       }
     } catch (err) {
-      console.error("Telegram polling error:", err);
-      await new Promise((r) => setTimeout(r, 3000));
+      console.error("Telegram polling error:", err instanceof Error ? err.message : err);
+      await sleep(3000);
     }
   }
 }
 
-function startTelegramPollingOrThrow() {
-  const token = getTelegramBotToken();
-  if (!token) {
-    throw new Error("Missing TELEGRAM_BOT_TOKEN in environment.");
-  }
+function startTelegramPolling() {
   console.log("Telegram long polling started.");
   telegramPollingLoop();
 }
@@ -1119,16 +1195,13 @@ async function runDailyRollover() {
     console.error("Daily rollover: failed to reopen pushed tasks:", reopenError.message);
   }
 
-  const { error: deleteError } = await supabase.from("tasks").delete().eq("status", "completed");
+  const { error: deleteError } = await supabase
+    .from("tasks")
+    .delete()
+    .in("status", ["completed", "canceled"]);
 
   if (deleteError) {
-    console.error("Daily rollover: failed to delete completed tasks:", deleteError.message);
-  }
-
-  const { error: deleteCanceledError } = await supabase.from("tasks").delete().eq("status", "canceled");
-
-  if (deleteCanceledError) {
-    console.error("Daily rollover: failed to delete canceled tasks:", deleteCanceledError.message);
+    console.error("Daily rollover: failed to delete closed tasks:", deleteError.message);
   }
 
   try {
@@ -1141,24 +1214,10 @@ async function runDailyRollover() {
   }
 }
 
-function startDailyRolloverCron() {
-  cron.schedule(
-    "0 5 * * *",
-    () => {
-      runDailyRollover().catch((err) => console.error("Daily rollover error:", err));
-    },
-    { timezone: "America/Los_Angeles" }
-  );
-  console.log(
-    "Daily rollover scheduled for 5:00 America/Los_Angeles (pushed→open, delete completed + canceled)."
-  );
-}
-
 async function runSmartReminderTick() {
   const now = new Date();
-  const debugEnabled = String(process.env.DEBUG || "").toLowerCase() === "true";
   const debug = (...args) => {
-    if (debugEnabled) console.log("[smartreminder]", ...args);
+    if (config.debug) console.log("[smartreminder]", ...args);
   };
 
   let gates;
@@ -1173,7 +1232,7 @@ async function runSmartReminderTick() {
     return;
   }
 
-  const horizonEnd = new Date(now.getTime() + 36 * 60 * 60000);
+  const horizonEnd = new Date(now.getTime() + CALENDAR_HORIZON_HOURS * 60 * 60000);
 
   let busyIntervals;
   try {
@@ -1228,7 +1287,7 @@ async function runSmartReminderTick() {
   }
 
   try {
-    await telegramSendMessage(getReminderChatId(), message);
+    await telegramSendMessage(config.reminderChatId, message);
   } catch (err) {
     debug("Telegram send failed:", err instanceof Error ? err.message : err);
     return;
@@ -1241,43 +1300,70 @@ async function runSmartReminderTick() {
   }
 }
 
-function startSmartReminderCron() {
-  cron.schedule(
-    "*/10 * * * *",
-    () => {
-      runSmartReminderTick().catch((err) => console.error("Smart reminder tick error:", err));
-    },
-    { timezone: AMERICA_LOS_ANGELES_TZ }
-  );
-  console.log(
-    "Smart reminders scheduled every 10 minutes (12:00–22:00 PT, ≥30 min free gap, caps + cooldown enforced)."
-  );
+const inFlightJobs = new Set();
+
+/**
+ * Cron ticks are skipped, not queued, while the previous run is still going. Without this
+ * a reminder tick that outlives its 10-minute interval could double-send.
+ */
+function runExclusive(name, fn) {
+  return () => {
+    if (inFlightJobs.has(name)) {
+      console.warn(`${name}: previous run still in flight; skipping this tick.`);
+      return;
+    }
+    inFlightJobs.add(name);
+    Promise.resolve()
+      .then(fn)
+      .catch((err) => console.error(`${name} error:`, err instanceof Error ? err.message : err))
+      .finally(() => inFlightJobs.delete(name));
+  };
 }
 
-function startNightlyDigestCron() {
-  cron.schedule(
-    "0 22 * * *",
-    () => {
-      runNightlyDigest().catch((err) => console.error("Nightly digest error:", err));
-    },
-    { timezone: AMERICA_LOS_ANGELES_TZ }
-  );
-  console.log("Nightly task digest scheduled for 22:00 America/Los_Angeles.");
+const SCHEDULED_JOBS = [
+  {
+    name: "Daily rollover",
+    expression: "0 5 * * *",
+    run: runDailyRollover,
+    note: "05:00 PT (pushed→open, delete completed + canceled, clear reminders)"
+  },
+  { name: "Morning message", expression: "30 5 * * *", run: runMorningMessage, note: "05:30 PT" },
+  {
+    name: "Smart reminder",
+    expression: "*/10 * * * *",
+    run: runSmartReminderTick,
+    note: "every 10 minutes (12:00–22:00 PT, ≥30 min free gap, caps + cooldown enforced)"
+  },
+  { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 PT" }
+];
+
+function startScheduledJobs() {
+  for (const job of SCHEDULED_JOBS) {
+    cron.schedule(job.expression, runExclusive(job.name, job.run), {
+      timezone: AMERICA_LOS_ANGELES_TZ
+    });
+    console.log(`Scheduled ${job.name}: ${job.note}.`);
+  }
 }
 
-function startMorningMessageCron() {
-  cron.schedule(
-    "30 5 * * *",
-    () => {
-      runMorningMessage().catch((err) => console.error("Morning message error:", err));
-    },
-    { timezone: AMERICA_LOS_ANGELES_TZ }
-  );
-  console.log("Morning message scheduled for 05:30 America/Los_Angeles.");
+let shuttingDown = false;
+
+/** Railway sends SIGTERM on redeploy; finish the message in hand so it is not replayed. */
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; finishing in-flight work before exit.`);
+  pollingActive = false;
+  try {
+    await inFlightDispatch;
+  } catch {
+    // Dispatch failures are already logged at the point they happen.
+  }
+  process.exit(0);
 }
 
-startDailyRolloverCron();
-startSmartReminderCron();
-startNightlyDigestCron();
-startMorningMessageCron();
-startTelegramPollingOrThrow();
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+startScheduledJobs();
+startTelegramPolling();

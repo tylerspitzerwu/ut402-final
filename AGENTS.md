@@ -42,14 +42,18 @@ Tyler (Telegram)  --getUpdates (long poll)-->  Node process (server.js)
 
 - **Entry:** `npm start` → `node server.js` (`package.json`).
 - **Module type:** CommonJS (`"type": "commonjs"`).
-- **Node:** 20+ required by `@supabase/supabase-js`; production uses Node 22 on Railway.
+- **Node:** pinned to `>=22` via `engines` in `package.json`, so Nixpacks does not silently pick a different major.
 - **Secrets:** `dotenv` loads `.env` locally. Production injects the same names as environment variables. `.env` is gitignored; never commit it or paste secret values into docs, commits, or chat.
 
 On boot the process:
 
-1. Creates a Supabase client (fails fast if URL/key missing).
-2. Registers four `node-cron` jobs (timezone `America/Los_Angeles`).
-3. Starts the Telegram polling loop (fails fast if `TELEGRAM_BOT_TOKEN` is missing).
+1. Builds and freezes `config`, validating **every** required environment variable (fails fast on any missing name).
+2. Creates a Supabase client.
+3. Registers four `node-cron` jobs (timezone `America/Los_Angeles`), each wrapped in a single-flight guard.
+4. Installs `SIGTERM` / `SIGINT` handlers that stop polling, let the message currently being handled finish, then exit 0.
+5. Starts the Telegram polling loop.
+
+**Every outbound request has a timeout** (`fetchWithTimeout` + `TIMEOUT_MS`): Anthropic 20s, Google 10s, Telegram 10s, and 55s for the long poll, which needs headroom over its own `timeout=50`. This matters more than it looks: handling is serial and single-threaded, so one hung request without a timeout stalls the entire bot for as long as it hangs. Any new call site must go through `fetchWithTimeout`.
 
 There is **no** Express/HTTP listener and **no** `PORT` bind. Do not add a web server unless a host requires a healthcheck. Do not use Trigger.dev or any external scheduler; scheduling stays in this process.
 
@@ -74,18 +78,20 @@ There is no frontend, no tests suite, no Dockerfile, no `railway.toml`. Railway 
 
 All names are read in `server.js`. Production (Railway **Variables** tab) must define the same set. Locally they live in `.env`.
 
+`buildConfig()` reads and validates **every required variable at boot** and freezes the result, so a missing credential crashes the process immediately instead of surfacing at 05:30 or midday. Nothing re-reads `process.env` at request time.
+
 | Name | Required | Purpose |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | yes (startup) | Bot API token; long poll + `sendMessage` |
-| `TELEGRAM_CHAT_ID` | yes (scheduled sends) | Destination for reminders, morning, nightly digest |
-| `ANTHROPIC_API_KEY` | yes (task NL + copy) | Claude Messages API |
+| `TELEGRAM_CHAT_ID` | yes (startup) | Destination for reminders, morning, nightly digest |
+| `ANTHROPIC_API_KEY` | yes (startup) | Claude Messages API |
 | `CLAUDE_MODEL` | no | Default `claude-haiku-4-5-20251001` |
 | `SUPABASE_URL` | yes (startup) | Project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | yes (startup) | Server-side access; bypasses RLS. Treat as a secret. |
-| `GOOGLE_CLIENT_ID` | yes (reminders) | OAuth client for Calendar |
-| `GOOGLE_CLIENT_SECRET` | yes | OAuth secret |
-| `GOOGLE_REFRESH_TOKEN` | yes | Offline token → access token |
-| `GOOGLE_CALENDAR_IDS` | yes | Comma-separated calendar IDs (e.g. `primary,user@gmail.com`) |
+| `GOOGLE_CLIENT_ID` | yes (startup) | OAuth client for Calendar |
+| `GOOGLE_CLIENT_SECRET` | yes (startup) | OAuth secret |
+| `GOOGLE_REFRESH_TOKEN` | yes (startup) | Offline token → access token |
+| `GOOGLE_CALENDAR_IDS` | yes (startup) | Comma-separated calendar IDs (e.g. `primary,user@gmail.com`) |
 | `DEBUG` | no | `true` enables extra reminder-tick logs and debug payloads on some errors. Production should be `false`. |
 | `NODE_ENV` | no | Set `production` on Railway |
 
@@ -118,9 +124,13 @@ Columns used: `id`, `created_at`, `task_ids` (array of task UUIDs suggested in t
 
 Daily cap counts rows with `created_at >=` the current reminder-day start (05:00 PT). Cooldown uses the most recent row’s `created_at`. Rollover **deletes all reminder rows**.
 
+Both gates are answered by a **single** query for rows since the reminder-day start (`listRemindersSince`). Restricting the cooldown check to today is safe because the send window opens at 12:00 PT, so any reminder from a previous day is already hours past the 120-minute cooldown. The rollover delete filters on `.not("id", "is", null)` rather than comparing `id` to a number, so it works whether `id` is a bigint or a UUID.
+
 ## Telegram interaction
 
-Polling: `getUpdates` with `timeout=50`, offset advanced per `update_id`. Only `message.text` is handled (no photos, callbacks, etc.). On HTTP/API failure the loop waits 3s and retries.
+Polling: `getUpdates` with `timeout=50`, `limit=10`, `allowed_updates=["message"]`, offset advanced per `update_id`. Only `message.text` is handled (no photos, callbacks, etc.). On HTTP/API failure the loop waits 3s and retries.
+
+Handling is **strictly serial**: the loop finishes one message (Claude call included) before fetching the next batch, which keeps replies in order. Do not make this concurrent without a reason; the stall risk it used to carry is handled by request timeouts instead.
 
 **Commands** (exact `/list`, `/help`, `/start`, `/clear`, also prefixes like `/list `):
 
@@ -138,6 +148,8 @@ Any other text goes to `processTaskQuery`: Claude returns JSON operations; this 
 - `complete` → `completed`.
 - `push` → `pushed` (comes back at 05:00 PT).
 
+`applyTaskOperations` batches these to keep the reply fast: **one** insert for all creates, **one** update per destination status (`.in("id", ids).eq("status", "open")`), and one update per distinct field payload for `update` ops. Updates run before status transitions so “rename X and mark it done” applies both. Since batched writes cannot use `.single()`, a stale or invented `targetId` is detected by diffing the returned `id` set against the requested one, not by a zero-row error. Keep the `.eq("status", "open")` guard on every write: it is what stops Claude from reviving a closed task.
+
 Claude is instructed: JSON only; friendly `message` without IDs/urgency/duration; multi-task replies use `- ` bullets.
 
 Replies longer than 4096 characters are split (`splitTelegramText`).
@@ -153,6 +165,8 @@ Do not switch these to UTC cron without changing the timezone option. Function n
 | `*/10 * * * *` | every 10 min | `runSmartReminderTick` | Smart reminder (see below) |
 | `0 22 * * *` | 22:00 | `runNightlyDigest` | Deterministic recap: completed / canceled / still open; **not** Claude |
 
+Jobs are registered from the `SCHEDULED_JOBS` table and wrapped in `runExclusive`, which **skips** a tick if the previous run of that same job is still in flight (it does not queue it). This is what stops a slow reminder tick from overlapping the next 10-minute fire and double-sending.
+
 If a job throws, it is logged; the process stays up.
 
 ## Smart reminders (deterministic gates, Claude phrasing)
@@ -163,9 +177,9 @@ Implemented in `runSmartReminderTick` / `canSendReminderNow`. Product intent: re
 
 1. Wall clock in PT is between **12:00 and 22:00** inclusive (`isWithinEtSendWindow`).
 2. Fewer than **3** reminder rows since **05:00 PT** today (`getReminderDayStartEtUtc`).
-3. At least **120 minutes** since the latest reminder `created_at` (any day; uses most recent row).
+3. At least **120 minutes** since the latest reminder `created_at` (uses the most recent row since the reminder-day start).
 4. Google Calendar: current time is **not** inside a busy interval.
-5. Remaining free gap until next busy block (or 36-hour fetch horizon) is **≥ 30 minutes** (`MIN_FREE_GAP_MINUTES_FOR_REMINDER`).
+5. Remaining free gap until next busy block (or the fetch horizon) is **≥ 30 minutes** (`MIN_FREE_GAP_MINUTES_FOR_REMINDER`).
 6. At least one **open** task with `duration` ≤ remaining gap minutes.
 
 Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThatFit`). Claude writes 1–3 suggestive sentences. On Claude failure, a template fallback is sent. After a successful Telegram send, insert a `reminders` row (even if persist fails, the user already got the message — next tick may double-send if insert failed).
@@ -176,10 +190,14 @@ Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThat
 - Ignore **all-day** (`start.date` / `end.date`).
 - Ignore **cancelled** events.
 - Ignore events where the **self** attendee `responseStatus` is `declined`.
-- Fetch each ID in `GOOGLE_CALENDAR_IDS`, merge overlapping intervals.
-- Horizon: now + **36 hours**.
+- Fetch every ID in `GOOGLE_CALENDAR_IDS` **in parallel**, following `nextPageToken`, then merge overlapping intervals.
+- Horizon: now + **6 hours** (`CALENDAR_HORIZON_HOURS`).
 
-OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Events list API.
+The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any decision — it only inflated the “you have about N minutes free” number on an empty calendar. If you raise it, cap what the reminder copy advertises.
+
+Requests send a `fields` mask (`CALENDAR_FIELDS_MASK`) covering only what `parseGoogleEventBusyInterval` reads, with `maxResults=250` per page. Widening the parser means widening the mask, or the new field will silently arrive as `undefined`.
+
+OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Events list API. The access token is **cached** in memory until 5 minutes before its `expires_in`, and dropped on a `401` so the next tick re-fetches.
 
 ## Claude usage (three call sites)
 
@@ -208,7 +226,9 @@ Anthropic: `POST https://api.anthropic.com/v1/messages`, header `anthropic-versi
 - **Do not** enable an HTTP healthcheck on `$PORT` unless you also add a listener.
 - **Replicas: 1.** Two instances = two pollers.
 
-**Logs:** Railway deploy logs should show Telegram polling started and the four cron registration lines. Set `DEBUG=true` only when diagnosing reminder skips (`[smartreminder]`).
+**Logs:** Railway deploy logs should show the four `Scheduled <job>:` registration lines followed by `Telegram long polling started.` Set `DEBUG=true` only when diagnosing reminder skips (`[smartreminder]`).
+
+**Redeploys:** Railway sends `SIGTERM`, which the process handles by stopping the poll loop, finishing the message in hand, and exiting 0. Because the `getUpdates` offset is only advanced as updates are handled, an update interrupted by a deploy is redelivered rather than lost.
 
 **Local run (dev only):**
 
@@ -227,6 +247,8 @@ npm start
 - Prefer fixing Railway by config (sleeping, healthcheck, replica count) over adding HTTP, unless the platform requires a bind.
 - When changing reminder product rules, update **both** `server.js` and this file in the same change.
 - After behavior changes, verify: one poller, `/list` still works, 05:00 rollover status transitions, reminder gates still deterministic.
+- Treat network round trips as the thing to minimize; nothing here is CPU-bound. Batch Supabase writes, do not re-read rows the caller will not use, and never re-fetch a list just to return it up the stack.
+- Route new outbound calls through `fetchWithTimeout`, and read configuration from `config` rather than `process.env`.
 - Optimize for **the single owner’s convenience**: fewer steps, faster replies, stay in Telegram. Do not add auth, onboarding, settings screens, or “are you sure?” flows for routine task ops unless there is a real data-loss risk (`/clear` is the main bulk-destructive command).
 - Prefer one Claude call per user message over multi-step agent loops.
 - Reliability of always-on scheduling beats extra features that make the bot slower or require opening another app.
