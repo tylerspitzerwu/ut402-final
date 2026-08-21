@@ -14,7 +14,7 @@ const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
 const TELEGRAM_MAX_MESSAGE_LEN = 4096;
-const AMERICA_LOS_ANGELES_TZ = "America/Los_Angeles";
+const DEFAULT_TIME_ZONE = "America/Los_Angeles";
 /** Minutes of free time until the next busy block (or horizon) required before sending a reminder. */
 const MIN_FREE_GAP_MINUTES_FOR_REMINDER = 30;
 /** How far ahead to look for busy blocks. Every gate compares against <= 30 minutes. */
@@ -68,6 +68,119 @@ function buildConfig() {
 const config = buildConfig();
 
 const supabase = createClient(config.supabaseUrl, config.supabaseKey);
+
+const TIME_ZONE_ALIASES = new Map(
+  Object.entries({
+    eastern: "America/New_York",
+    "eastern time": "America/New_York",
+    et: "America/New_York",
+    est: "America/New_York",
+    edt: "America/New_York",
+    central: "America/Chicago",
+    "central time": "America/Chicago",
+    ct: "America/Chicago",
+    cst: "America/Chicago",
+    cdt: "America/Chicago",
+    mountain: "America/Denver",
+    "mountain time": "America/Denver",
+    mt: "America/Denver",
+    mst: "America/Denver",
+    mdt: "America/Denver",
+    pacific: "America/Los_Angeles",
+    "pacific time": "America/Los_Angeles",
+    pt: "America/Los_Angeles",
+    pst: "America/Los_Angeles",
+    pdt: "America/Los_Angeles",
+    arizona: "America/Phoenix",
+    alaska: "America/Anchorage",
+    hawaii: "Pacific/Honolulu",
+    utc: "UTC",
+    gmt: "UTC"
+  })
+);
+
+function normalizeTimeZone(rawValue) {
+  const value = typeof rawValue === "string" ? rawValue.trim() : "";
+  if (!value) throw new Error("Timezone must be a non-empty string.");
+  const candidate = TIME_ZONE_ALIASES.get(value.toLowerCase()) || value;
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: candidate }).resolvedOptions().timeZone;
+  } catch {
+    throw new Error(`Unknown timezone "${value}".`);
+  }
+}
+
+const SETTING_DEFINITIONS = Object.freeze({
+  timezone: Object.freeze({
+    label: "Timezone",
+    defaultValue: DEFAULT_TIME_ZONE,
+    description:
+      'IANA timezone for all local schedules. Examples: "America/New_York" for Eastern and "America/Los_Angeles" for Pacific.',
+    normalize: normalizeTimeZone,
+    formatValue: (value) => value,
+    onChange: () => startScheduledJobs(),
+    formatResult: ({ value, changed }) =>
+      changed
+        ? `Timezone set to ${value}. Scheduled messages now follow that local time.`
+        : `Timezone is already ${value}.`
+  })
+});
+
+const runtimeSettings = Object.fromEntries(
+  Object.entries(SETTING_DEFINITIONS).map(([key, definition]) => [key, definition.defaultValue])
+);
+
+function getSetting(key) {
+  return runtimeSettings[key];
+}
+
+function getActiveTimeZone() {
+  return getSetting("timezone");
+}
+
+function isOwnerChat(chatId) {
+  return String(chatId) === String(config.reminderChatId);
+}
+
+async function loadRuntimeSettings() {
+  const keys = Object.keys(SETTING_DEFINITIONS);
+  const { data, error } = await supabase.from("bot_settings").select("key,value").in("key", keys);
+  if (error) throw new Error(`Supabase load settings failed: ${error.message}`);
+
+  for (const row of Array.isArray(data) ? data : []) {
+    const definition = SETTING_DEFINITIONS[row?.key];
+    if (!definition) continue;
+    try {
+      runtimeSettings[row.key] = definition.normalize(row.value);
+    } catch (err) {
+      throw new Error(
+        `Invalid stored setting "${row.key}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+}
+
+async function persistRuntimeSetting(key, rawValue) {
+  const definition = SETTING_DEFINITIONS[key];
+  if (!definition) throw new Error(`Setting "${key}" is not supported.`);
+  const value = definition.normalize(rawValue);
+  const previousValue = runtimeSettings[key];
+
+  const { error } = await supabase.from("bot_settings").upsert(
+    {
+      key,
+      value,
+      updated_at: new Date().toISOString()
+    },
+    { onConflict: "key" }
+  );
+  if (error) throw new Error(`Supabase save setting failed: ${error.message}`);
+
+  runtimeSettings[key] = value;
+  const changed = previousValue !== value;
+  if (changed) definition.onChange?.(value, previousValue);
+  return { key, value, changed };
+}
 
 /** Every outbound request goes through here so nothing can hang the single-threaded loop. */
 function fetchWithTimeout(url, options, timeoutMs) {
@@ -159,23 +272,24 @@ function makeDateInTimeZone(local, timeZone) {
   return guess;
 }
 
-function isWithinEtSendWindow(now = new Date()) {
-  const p = getZonedParts(now, AMERICA_LOS_ANGELES_TZ);
+function isWithinReminderSendWindow(now = new Date()) {
+  const p = getZonedParts(now, getActiveTimeZone());
   const minutes = p.hour * 60 + p.minute;
   return minutes >= 12 * 60 && minutes <= 22 * 60;
 }
 
-function getReminderDayStartEtUtc(now = new Date()) {
-  const p = getZonedParts(now, AMERICA_LOS_ANGELES_TZ);
+function getReminderDayStartUtc(now = new Date()) {
+  const timeZone = getActiveTimeZone();
+  const p = getZonedParts(now, timeZone);
   const anchor = new Date(now.getTime());
   if (p.hour < 5) {
-    // Move to previous day in PT by subtracting 12h (safe) and re-read parts.
+    // Move to the previous local day by subtracting 12h (safe) and re-read parts.
     anchor.setTime(anchor.getTime() - 12 * 60 * 60000);
   }
-  const a = getZonedParts(anchor, AMERICA_LOS_ANGELES_TZ);
+  const a = getZonedParts(anchor, timeZone);
   return makeDateInTimeZone(
     { year: a.year, month: a.month, day: a.day, hour: 5, minute: 0, second: 0 },
-    AMERICA_LOS_ANGELES_TZ
+    timeZone
   );
 }
 
@@ -375,6 +489,8 @@ function normalizeOperationListPayload(raw) {
   return operations.map((op) => normalizeOperationPayload(op || {}));
 }
 
+const TASK_OPERATIONS = new Set(["create", "update", "delete", "complete", "push"]);
+
 function countAppliedByType(results, operation) {
   return results.filter((r) => r?.requested?.operation === operation && r.applied).length;
 }
@@ -439,8 +555,21 @@ function normalizeOperationPayload(raw) {
   const operationRaw = String(raw?.operation || "")
     .trim()
     .toLowerCase();
-  const allowed = new Set(["create", "update", "delete", "complete", "push"]);
-  const operation = allowed.has(operationRaw) ? operationRaw : "create";
+  if (operationRaw === "set_setting") {
+    return {
+      operation: "set_setting",
+      key: typeof raw?.key === "string" ? raw.key.trim().toLowerCase() : "",
+      value: raw?.value
+    };
+  }
+  if (!TASK_OPERATIONS.has(operationRaw)) {
+    return {
+      operation: "invalid",
+      rawOperation: operationRaw
+    };
+  }
+
+  const operation = operationRaw;
   const targetId = typeof raw?.targetId === "string" ? raw.targetId.trim() : "";
 
   if (operation === "create") {
@@ -507,7 +636,7 @@ async function listTasksGroupedByStatus(statuses) {
 
 /**
  * One query answers both reminder gates. Looking only at today is safe for the cooldown:
- * the send window opens at 12:00 PT, so any reminder from a previous day is already
+ * the local send window opens at 12:00, so any reminder from a previous day is already
  * hours past the 120-minute cooldown.
  */
 async function listRemindersSince(iso) {
@@ -534,9 +663,9 @@ async function clearAllReminders() {
 }
 
 async function canSendReminderNow(now = new Date()) {
-  if (!isWithinEtSendWindow(now)) return { ok: false, reason: "outside_send_window" };
+  if (!isWithinReminderSendWindow(now)) return { ok: false, reason: "outside_send_window" };
 
-  const dayStart = getReminderDayStartEtUtc(now);
+  const dayStart = getReminderDayStartUtc(now);
   const dayStartIso = dayStart.toISOString();
   const sentToday = await listRemindersSince(dayStartIso);
   if (sentToday.length >= 3) return { ok: false, reason: "daily_cap" };
@@ -681,24 +810,134 @@ async function applyTaskOperations(operations) {
   return results;
 }
 
-async function processTaskQuery(query) {
+async function applySettingOperation(operation, allowSettings) {
+  if (!allowSettings) {
+    return {
+      requested: operation,
+      applied: false,
+      userMessage: "Only the configured owner chat can change bot settings."
+    };
+  }
+
+  const definition = SETTING_DEFINITIONS[operation.key];
+  if (!definition) {
+    return {
+      requested: operation,
+      applied: false,
+      userMessage: `I can’t change the “${operation.key || "unknown"}” setting yet.`
+    };
+  }
+
+  let normalizedValue;
+  try {
+    normalizedValue = definition.normalize(operation.value);
+  } catch (err) {
+    return {
+      requested: operation,
+      applied: false,
+      userMessage: `I couldn’t change ${definition.label.toLowerCase()}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    };
+  }
+
+  try {
+    const saved = await persistRuntimeSetting(operation.key, normalizedValue);
+    return {
+      requested: operation,
+      applied: true,
+      value: saved.value,
+      changed: saved.changed,
+      userMessage: definition.formatResult(saved)
+    };
+  } catch {
+    return {
+      requested: operation,
+      applied: false,
+      userMessage: `I couldn’t save the ${definition.label.toLowerCase()} setting right now.`
+    };
+  }
+}
+
+async function applyUserOperations(operations, { allowSettings }) {
+  const taskOperations = operations.filter((op) => TASK_OPERATIONS.has(op.operation));
+  const results = await applyTaskOperations(taskOperations);
+
+  for (const operation of operations) {
+    if (operation.operation === "set_setting") {
+      results.push(await applySettingOperation(operation, allowSettings));
+    } else if (operation.operation === "invalid") {
+      results.push({
+        requested: operation,
+        applied: false,
+        userMessage: "I couldn’t apply an unsupported change."
+      });
+    }
+  }
+  return results;
+}
+
+function buildUserQueryMessage(parsedMessage, operations, results) {
+  const taskOperations = operations.filter((op) => TASK_OPERATIONS.has(op.operation));
+  const settingLikeOperations = operations.filter(
+    (op) => op.operation === "set_setting" || op.operation === "invalid"
+  );
+  const taskResults = results.filter((result) => TASK_OPERATIONS.has(result?.requested?.operation));
+  const parts = [];
+
+  if (taskOperations.length) {
+    parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(taskResults));
+  } else if (!settingLikeOperations.length) {
+    parts.push(normalizeMessage(parsedMessage) || buildFallbackMessageFromResults(results));
+  }
+
+  for (const result of results) {
+    if (
+      (result?.requested?.operation === "set_setting" ||
+        result?.requested?.operation === "invalid") &&
+      result.userMessage
+    ) {
+      parts.push(result.userMessage);
+    }
+  }
+
+  return parts.filter(Boolean).join("\n");
+}
+
+function settingsPromptPayload() {
+  return Object.fromEntries(
+    Object.entries(SETTING_DEFINITIONS).map(([key, definition]) => [
+      key,
+      {
+        currentValue: runtimeSettings[key],
+        description: definition.description
+      }
+    ])
+  );
+}
+
+async function processUserQuery(query, { allowSettings }) {
   const currentTasks = await listOpenTasks();
   const prompt = [
-    "You are a task operation parser named Tod.",
-    "Given the user request and current task list, return JSON only with the shape:",
-    '{ "operations": [ { operation, targetId, title, urgency, duration }, ... ], "message": "..." }',
-    'operation must be one of: "create" | "update" | "delete" | "complete" | "push".',
+    "You are an operation parser for a personal task assistant named Tod.",
+    "Given the user request, current task list, and supported settings, return JSON only with the shape:",
+    '{ "operations": [ { operation, targetId, title, urgency, duration, key, value }, ... ], "message": "..." }',
+    'operation must be one of: "create" | "update" | "delete" | "complete" | "push" | "set_setting".',
     "Return one operation per requested change. Multiple operations are allowed in one response.",
     'Use "create" for new tasks, "update" to change title/urgency/duration, "delete" when the user abandons a task (not doing it — maps to cancelled),',
-    '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am Pacific).',
+    '"complete" when the user finished a task, "push" when the user defers a task to the next day (maps to pushed; the server reopens pushed tasks as open every day at 5am in the active timezone).',
     "Current tasks lists only tasks with status open. Every targetId for update/delete/complete/push must be one of those ids.",
     "For update/delete/complete/push, set targetId to the id of the existing task.",
     "For create, targetId should be null or omitted.",
     "Urgency must be 1-10, duration in minutes.",
     "For update, title/urgency/duration are optional; omit or set null to keep the current value.",
     "For delete, complete, and push, title/urgency/duration are ignored.",
+    'Use "set_setting" when the user asks to change a supported bot preference. Set key to an exact supported setting key and value to its new value.',
+    'For timezone, translate phrases such as "Eastern time" to an IANA timezone such as "America/New_York".',
+    "Never turn a request to change Tod’s behavior into a task. If the requested behavior is not a supported setting, return no operation for it and explain that limitation in message.",
     "",
-    'Also include a user-facing "message" string that summarizes what you did in friendly natural language.',
+    'Also include a user-facing "message" string that summarizes task changes or answers in friendly natural language.',
+    'Do not claim that a setting changed in "message"; the server will confirm setting results after validating and saving them. For a setting-only request, use an empty message.',
     'Do not mention JSON, operations arrays, fields, or any implementation details in "message".',
     'In "message", never include urgency, duration, task ids, or any numeric or internal metadata.',
     'Write "message" in natural conversational prose: use each task’s meaning, weave it into full sentences the way you would in speech, and paraphrase freely; do not recite or quote the stored task titles verbatim.',
@@ -709,6 +948,7 @@ async function processTaskQuery(query) {
     "Important: output JSON only. No prose. No markdown. No code fences.",
     "",
     `Current tasks: ${JSON.stringify(currentTasks)}`,
+    `Supported settings: ${JSON.stringify(settingsPromptPayload())}`,
     `User request: ${query}`
   ].join("\n");
 
@@ -733,7 +973,7 @@ async function processTaskQuery(query) {
       TIMEOUT_MS.anthropic
     );
   } catch (error) {
-    throw taskError("I couldn’t update your tasks right now.", {
+    throw taskError("I couldn’t handle that request right now.", {
       type: "anthropic_fetch_failed",
       details:
         error instanceof Error
@@ -744,7 +984,7 @@ async function processTaskQuery(query) {
 
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text();
-    throw taskError("I couldn’t update your tasks right now.", {
+    throw taskError("I couldn’t handle that request right now.", {
       type: "anthropic_api_error",
       status: claudeResponse.status,
       details: errorText.slice(0, 2000)
@@ -785,9 +1025,9 @@ async function processTaskQuery(query) {
     });
   }
 
-  const results = await applyTaskOperations(operations);
+  const results = await applyUserOperations(operations, { allowSettings });
   return {
-    message: normalizeMessage(parsed?.message) || buildFallbackMessageFromResults(results)
+    message: buildUserQueryMessage(parsed?.message, operations, results)
   };
 }
 
@@ -822,6 +1062,16 @@ function splitTelegramText(text) {
   return chunks;
 }
 
+function formatZonedClock(date, timeZone = getActiveTimeZone()) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short"
+  }).format(date);
+}
+
 async function telegramApi(method, body) {
   const url = `https://api.telegram.org/bot${config.telegramBotToken}/${method}`;
   const response = await fetchWithTimeout(
@@ -852,10 +1102,7 @@ async function telegramSendMessage(chatId, text) {
 }
 
 async function generateReminderCopy({ remainingMinutes, gapEnd, tasks }) {
-  const gapEndPt = gapEnd ? getZonedParts(gapEnd, AMERICA_LOS_ANGELES_TZ) : null;
-  const gapEndStr = gapEndPt
-    ? `${String(gapEndPt.hour).padStart(2, "0")}:${String(gapEndPt.minute).padStart(2, "0")} PT`
-    : "";
+  const gapEndStr = gapEnd ? formatZonedClock(gapEnd) : "";
 
   const prompt = [
     "You are a friendly personal productivity assistant.",
@@ -1067,12 +1314,23 @@ function telegramHelpText() {
   return [
     "Task Thread (Telegram)",
     "",
-    "Send any message to manage tasks in natural language (add, edit, mark done, cancel, or push to tomorrow).",
+    "Send any message to manage tasks or supported bot settings in natural language.",
+    'For example: “I’m in Eastern time now.”',
     "",
     "Commands:",
     "/list — open tasks",
+    "/settings — current bot settings",
     "/clear — cancel all open tasks",
     "/help — this text"
+  ].join("\n");
+}
+
+function telegramSettingsText() {
+  return [
+    "Bot settings:",
+    ...Object.entries(SETTING_DEFINITIONS).map(
+      ([key, definition]) => `• ${definition.label}: ${definition.formatValue(runtimeSettings[key])}`
+    )
   ].join("\n");
 }
 
@@ -1097,6 +1355,11 @@ async function dispatchTelegramMessage(chatId, textRaw) {
     return;
   }
 
+  if (lower === "/settings" || lower.startsWith("/settings ")) {
+    await telegramSendMessage(chatId, telegramSettingsText());
+    return;
+  }
+
   if (lower === "/clear" || lower.startsWith("/clear ")) {
     try {
       await clearAllOpenTasks();
@@ -1108,7 +1371,7 @@ async function dispatchTelegramMessage(chatId, textRaw) {
   }
 
   try {
-    const payload = await processTaskQuery(text);
+    const payload = await processUserQuery(text, { allowSettings: isOwnerChat(chatId) });
     await telegramSendMessage(chatId, payload.message || "Done.");
   } catch (error) {
     const msg =
@@ -1116,7 +1379,7 @@ async function dispatchTelegramMessage(chatId, textRaw) {
         ? error.body.error
         : error instanceof Error
           ? error.message
-          : "I couldn’t update your tasks right now.";
+          : "I couldn’t handle that request right now.";
     await telegramSendMessage(chatId, msg);
   }
 }
@@ -1277,10 +1540,7 @@ async function runSmartReminderTick() {
   } catch (err) {
     debug("Claude reminder copy failed; using fallback:", err instanceof Error ? err.message : err);
     const titles = picked.map((t) => t?.title).filter(Boolean);
-    const until = gap.gapEnd ? getZonedParts(gap.gapEnd, AMERICA_LOS_ANGELES_TZ) : null;
-    const untilStr = until
-      ? `${String(until.hour).padStart(2, "0")}:${String(until.minute).padStart(2, "0")} PT`
-      : "";
+    const untilStr = gap.gapEnd ? formatZonedClock(gap.gapEnd) : "";
     message = `You’ve got about ${gap.remainingMinutes} minutes free${
       untilStr ? ` (until around ${untilStr})` : ""
     }. If you’re up for it, you could work on ${titles.slice(0, 3).join(" / ")}.`;
@@ -1325,24 +1585,40 @@ const SCHEDULED_JOBS = [
     name: "Daily rollover",
     expression: "0 5 * * *",
     run: runDailyRollover,
-    note: "05:00 PT (pushed→open, delete completed + canceled, clear reminders)"
+    note: "05:00 local (pushed→open, delete completed + canceled, clear reminders)"
   },
-  { name: "Morning message", expression: "30 5 * * *", run: runMorningMessage, note: "05:30 PT" },
+  { name: "Morning message", expression: "30 5 * * *", run: runMorningMessage, note: "05:30 local" },
   {
     name: "Smart reminder",
     expression: "*/10 * * * *",
     run: runSmartReminderTick,
-    note: "every 10 minutes (12:00–22:00 PT, ≥30 min free gap, caps + cooldown enforced)"
+    note: "every 10 minutes (12:00–22:00 local, ≥30 min free gap, caps + cooldown enforced)"
   },
-  { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 PT" }
+  { name: "Nightly digest", expression: "0 22 * * *", run: runNightlyDigest, note: "22:00 local" }
 ];
 
+let scheduledJobHandles = [];
+
 function startScheduledJobs() {
+  const timeZone = getActiveTimeZone();
+  const nextHandles = [];
+  try {
+    for (const job of SCHEDULED_JOBS) {
+      nextHandles.push(
+        cron.schedule(job.expression, runExclusive(job.name, job.run), {
+          timezone: timeZone
+        })
+      );
+    }
+  } catch (err) {
+    for (const task of nextHandles) task.stop();
+    throw err;
+  }
+
+  for (const task of scheduledJobHandles) task.stop();
+  scheduledJobHandles = nextHandles;
   for (const job of SCHEDULED_JOBS) {
-    cron.schedule(job.expression, runExclusive(job.name, job.run), {
-      timezone: AMERICA_LOS_ANGELES_TZ
-    });
-    console.log(`Scheduled ${job.name}: ${job.note}.`);
+    console.log(`Scheduled ${job.name}: ${job.note}; timezone ${timeZone}.`);
   }
 }
 
@@ -1354,6 +1630,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`${signal} received; finishing in-flight work before exit.`);
   pollingActive = false;
+  for (const task of scheduledJobHandles) task.stop();
   try {
     await inFlightDispatch;
   } catch {
@@ -1365,5 +1642,13 @@ async function shutdown(signal) {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-startScheduledJobs();
-startTelegramPolling();
+async function main() {
+  await loadRuntimeSettings();
+  startScheduledJobs();
+  startTelegramPolling();
+}
+
+main().catch((err) => {
+  console.error("Startup failed:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});
