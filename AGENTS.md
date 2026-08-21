@@ -115,7 +115,9 @@ Columns used in code: `id` (UUID), `title`, `urgency` (1–10), `duration` (minu
 | `canceled` | User abandoned it (`delete` op or `/clear`). Deleted at rollover. |
 | `pushed` | Deferred to tomorrow. Reopened to `open` at the 05:00 local rollover. |
 
-Claude may only target **open** rows for update/delete/complete/push. Create always inserts `status: "open"`. Defaults if Claude omits numbers: urgency `5`, duration `30`, title `"Untitled Task"`.
+For every natural-language user query, Claude receives one read-only snapshot of all currently retained statuses with `created_at` and `updated_at`, ordered newest first. `created_at` answers when a task was added; for a currently completed, canceled, or pushed row, `updated_at` marks when that status was applied because non-open rows cannot be changed again before rollover. “Today” for task-date questions starts at the active timezone’s **05:00 rollover**, not midnight. Completed and canceled rows remain available for these answers only until the next rollover deletes them.
+
+Claude may only target **open** rows for update/delete/complete/push, even though closed and pushed rows are visible as read-only context. The `.eq("status", "open")` database guards remain authoritative. Create always inserts `status: "open"`. Defaults if Claude omits numbers: urgency `5`, duration `30`, title `"Untitled Task"`.
 
 ### `reminders`
 
@@ -143,7 +145,7 @@ Interactive user/reply pairs share a `turn_id` and are inserted together only **
 
 Scheduled messages are stored as assistant-only turns with `kind` equal to `reminder`, `morning`, or `digest`. History writes and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history.
 
-The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. It has **no result-count limit**; Node pages through PostgREST responses until every matching row has been loaded, then re-filters every row to the allowed interval so companion rows outside the seven-day boundary cannot leak through. An empty query returns every turn in the requested interval. Both Node and the RPC clamp access to the rolling previous seven days, and the 05:00 rollover physically deletes older rows. This means stale rows remain inaccessible if cleanup fails.
+The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool exposes two modes: `recent` for an unresolved omitted object/action/antecedent, defaulting to the previous 30 minutes with no keyword filter; and `search` for an explicit topic or time-range lookup, defaulting to the rolling seven days. It has **no result-count limit**; Node pages through PostgREST responses until every matching row has been loaded, then re-filters every row to the allowed interval so companion rows outside the seven-day boundary cannot leak through. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
 
 ## Telegram interaction
 
@@ -160,11 +162,11 @@ Handling is **strictly serial**: the loop finishes one message (Claude call incl
 | `/settings` | Current allowlisted bot settings (not Claude) |
 | `/clear` | Sets all **open** tasks to `canceled` |
 
-Any other text goes to `processUserQuery`: Claude returns JSON operations; this process applies them to Supabase, then sends a user-facing response. Task prose comes from Claude (or a fallback); setting confirmations come from deterministic apply results so the bot cannot claim a failed setting write succeeded.
+Any other text goes to `processUserQuery`: Claude must finish through the structured `submit_operations` tool, whose input contains task/settings operations and a user-facing `message`. This process validates and applies the operations to Supabase, then sends the response. Task prose comes from Claude (or a fallback); setting confirmations come from deterministic apply results so the bot cannot claim a failed setting write succeeded.
 
-For the owner chat, the first `processUserQuery` Claude request also exposes a `search_chat_history` tool but sends no past conversation. Claude may call it at most once only when the current request contains an unresolved reference to prior conversation or explicitly asks about it. Standalone requests remain one Claude call and never query chat history. A warranted lookup adds one RPC and one final Claude call; the second call cannot invoke another tool.
+For the owner chat, the first `processUserQuery` Claude request exposes both `search_chat_history` and `submit_operations` but sends no past conversation. Tool choice is mandatory and parallel use is disabled: Claude either finishes immediately through `submit_operations` or performs one warranted history lookup. After a lookup, the second request exposes and forces only `submit_operations`, so another search is impossible. Non-owner chats receive only the forced submit tool.
 
-The server, not Claude, supplies the owner chat ID and clamps requested timestamps. Retrieved messages are context only: old requests do not authorize new task operations. Only the current Telegram message may cause writes.
+History is mandatory when an omitted object, action, or antecedent cannot be uniquely resolved from the current message and task snapshot. It is not used for standalone requests or task-date questions answerable from structured task timestamps. The server, not Claude, supplies the owner chat ID and clamps requested timestamps. Retrieved messages are context only: old requests do not authorize new task operations. If several antecedents remain plausible, Claude submits no operation and asks for clarification.
 
 **Operations Claude may emit:** `create` | `update` | `delete` | `complete` | `push` | `set_setting`.
 
@@ -175,7 +177,7 @@ The server, not Claude, supplies the owner chat ID and clamps requested timestam
 
 `applyTaskOperations` batches these to keep the reply fast: **one** insert for all creates, **one** update per destination status (`.in("id", ids).eq("status", "open")`), and one update per distinct field payload for `update` ops. Updates run before status transitions so “rename X and mark it done” applies both. Since batched writes cannot use `.single()`, a stale or invented `targetId` is detected by diffing the returned `id` set against the requested one, not by a zero-row error. Keep the `.eq("status", "open")` guard on every write: it is what stops Claude from reviving a closed task.
 
-Unknown operation names are rejected rather than coerced into task creation. Claude is instructed: JSON only; friendly task `message` without IDs/urgency/duration; multi-task replies use `- ` bullets; setting-only replies leave `message` empty because Node confirms the actual result.
+Unknown operation names are rejected rather than coerced into task creation. The structured submission schema requires an operations array and friendly task `message` without IDs/urgency/duration; multi-task replies use `- ` bullets; setting-only replies leave `message` empty because Node confirms the actual result.
 
 Replies longer than 4096 characters are split (`splitTelegramText`).
 
@@ -228,7 +230,7 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 
 | Call | Role | Must not do |
 | --- | --- | --- |
-| `processUserQuery` | Parse NL → task/settings JSON ops + task-facing `message`; optionally retrieve owner chat history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, or retrieve history for standalone requests |
+| `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps; optionally retrieve owner chat history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate closed tasks, or retrieve history for standalone/task-date requests |
 | `generateReminderCopy` | Phrase a reminder; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
 | `generateMorningCopy` | Phrase morning briefing; temperature 0.6, max_tokens 220 | Same |
 
