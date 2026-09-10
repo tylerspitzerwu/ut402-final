@@ -37,8 +37,8 @@ Tyler (Telegram)  --getUpdates (long poll)-->  Node process (server.js)
          |                  |                  |                       |
     Anthropic API           Google Calendar     Telegram sendMessage     Supabase
     (task ops JSON +        (busy intervals)    (replies + scheduled)    (tasks, nudges,
-     on-demand history)                            copy)                   reminders,
-                                                                           settings, history)
+     conversation context                          copy)                   reminders,
+     + history search)                                                     settings, history)
 ```
 
 - **Entry:** `npm start` → `node server.js` (`package.json`).
@@ -249,7 +249,7 @@ Credentials remain in frozen environment-backed `config`; preferences live in a 
 
 ### `chat_messages`
 
-Stores the configured owner chat’s user-visible conversation for on-demand Claude retrieval. Columns used in code: `id` (UUID), `turn_id` (UUID), `chat_id` (text), `telegram_message_id` (nullable bigint), `role` (`user` or `assistant`), `kind`, `content`, `created_at`, plus the generated `search_vector` used by PostgreSQL full-text search.
+Stores the configured owner chat’s user-visible conversation for an always-on recent context window and on-demand Claude search. Columns used in code: `id` (UUID), `turn_id` (UUID), `chat_id` (text), `telegram_message_id` (nullable bigint), `role` (`user` or `assistant`), `kind`, `content`, `created_at`, plus the generated `search_vector` used by PostgreSQL full-text search.
 
 ```sql
 create table public.chat_messages (
@@ -279,9 +279,11 @@ create index if not exists chat_messages_search_idx
 
 Interactive user/reply pairs share a `turn_id` and are inserted together only **after** the complete logical reply has been sent successfully to Telegram. This keeps the normal response path fast and prevents unsent assistant text from entering history. Store the original user text and exact user-visible reply, not raw Claude JSON, operations, tool calls, or debug payloads. A Telegram reply split into several 4096-character sends remains one assistant history row.
 
-Scheduled messages are stored as assistant-only turns with `kind` equal to `nudge`, `morning`, `digest`, or `reminder`. History writes and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history. A fired reminder for a non-owner chat is delivered, but not stored: `persistScheduledChatMessage` always writes as the owner, so it is only called for the owner chat.
+Scheduled messages are stored as assistant-only turns with `kind` equal to `nudge`, `morning`, `digest`, or `reminder`, and are eligible for the recent context window. History writes, recent reads, and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history. A fired reminder for a non-owner chat is delivered, but not stored: `persistScheduledChatMessage` always writes as the owner, so it is only called for the owner chat.
 
-The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool exposes two modes: `recent` when the current message leaves an object, action, or antecedent unresolved, defaulting to the previous 30 minutes with no keyword filter; and `search` for an explicit topic or time-range lookup, defaulting to the rolling seven days. There is **no result-count limit**. Node pages through PostgREST responses until every matching row has been loaded, then re-filters each row to the allowed interval so the other message in a matching turn cannot leak in if it falls outside the seven-day window. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
+Every owner query reads up to `CONVERSATION_CONTEXT_MAX_MESSAGES` (20) messages no older than `CONVERSATION_CONTEXT_MAX_AGE_MS` (three hours), in parallel with the task and reminder snapshots. A read failure is logged and degrades to an empty context window rather than failing the query. Rows are reordered chronologically with `user` before `assistant` when timestamps tie, then leading assistant-only rows are dropped so the Anthropic message history begins with a user turn. Claude receives these rows as real `user` / `assistant` messages; static operating instructions use the request’s top-level `system` field, and the latest user message carries the current clock, snapshots, settings, and request.
+
+The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool exposes only `search` mode for an explicit prior-conversation topic or time-range lookup that the recent context does not answer, defaulting to the rolling seven days. There is **no result-count limit**. Node pages through PostgREST responses until every matching row has been loaded, then re-filters each row to the allowed interval so the other message in a matching turn cannot leak in if it falls outside the seven-day window. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
 
 **Source-control gap:** the exact hosted SQL definition of `search_chat_history` is not present in this repository. The owner must export it from Supabase before this schema can be recreated from source; do not invent a replacement because ranking or boundary differences could change behavior.
 
@@ -295,9 +297,9 @@ Every non-empty text message goes to `processUserQuery`. There are no `/list`, `
 
 Claude must finish through the structured `submit_operations` tool, whose input contains task, setting, and reminder operations plus a user-facing `message`. This process validates and applies the operations to Supabase, then sends the response. Task prose comes from Claude (or a fallback). Setting and reminder confirmations come from deterministic apply results so the bot cannot claim a failed write succeeded. Cancel-all is one `delete` per currently open task, batched by `applyTaskOperations`.
 
-For the owner chat, the first `processUserQuery` Claude request exposes both `search_chat_history` and `submit_operations` but sends no past conversation. Tool choice is mandatory and parallel use is disabled: Claude either finishes immediately through `submit_operations` or performs one warranted history lookup. After a lookup, the second request exposes and forces only `submit_operations`, so another search is impossible. Non-owner chats receive only the forced submit tool.
+For the owner chat, the first `processUserQuery` Claude request sends the bounded recent conversation and exposes both `search_chat_history` and `submit_operations`. Tool choice is mandatory and parallel use is disabled: Claude either finishes immediately through `submit_operations` or performs one warranted search beyond the recent window. After a search, the second request preserves the same system prompt and conversation, exposes and forces only `submit_operations`, and cannot search again. Non-owner chats receive no conversation context and only the forced submit tool.
 
-History is mandatory when an omitted object, action, or antecedent cannot be uniquely resolved from the current message and task snapshot. It is not used for standalone requests or task-date questions answerable from structured task timestamps. The server, not Claude, supplies the owner chat ID and clamps requested timestamps. Retrieved messages are context only: old requests do not authorize new task operations. If several antecedents remain plausible, Claude submits no operation and asks for clarification.
+Recent conversation is supplied automatically so omitted objects, actions, and antecedents can be resolved without a second Claude call. On-demand search is reserved for explicit prior-conversation topic or time-range requests that the recent context does not answer; it is not used for standalone requests or task-date questions answerable from structured task timestamps. The server, not Claude, supplies the owner chat ID and clamps requested timestamps. Recent and searched messages are context only: old requests do not authorize new task operations. If several antecedents remain plausible, Claude submits no operation and asks for clarification.
 
 **Operations Claude may emit:** `create` | `update` | `delete` | `complete` | `push` | `set_setting` | `create_reminder` | `update_reminder` | `cancel_reminder`.
 
@@ -392,7 +394,7 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 
 | Call | Role | Must not do |
 | --- | --- | --- |
-| `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; optionally retrieve owner chat history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, or retrieve history for standalone/task-date requests |
+| `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; include a bounded owner conversation window and optionally search older owner history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, treat prior messages as current instructions, or search history for standalone/task-date requests |
 | `generateNudgeCopy` | Phrase a nudge; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
 | `generateMorningCopy` | Phrase morning briefing; temperature 0.6, max_tokens 220 | Choose which tasks to mention, or invent scheduling |
 
