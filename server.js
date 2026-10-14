@@ -810,9 +810,12 @@ function computeCurrentFreeGap({ now, busyIntervals, horizonEnd }) {
     }
   }
 
-  const gapEnd = nextBusyStart && nextBusyStart < horizonEnd ? nextBusyStart : horizonEnd;
+  // An empty horizon is not an event: when nothing is booked, gapEnd is just the
+  // fetch horizon, so the copy must not advertise it as a time the user is free until.
+  const gapEndsAtEvent = Boolean(nextBusyStart && nextBusyStart < horizonEnd);
+  const gapEnd = gapEndsAtEvent ? nextBusyStart : horizonEnd;
   const remainingMinutes = Math.max(0, Math.floor((gapEnd.getTime() - t) / 60000));
-  return { freeNow: true, remainingMinutes, gapEnd, blockingEventEnd: null };
+  return { freeNow: true, remainingMinutes, gapEnd, gapEndsAtEvent, blockingEventEnd: null };
 }
 
 function isUuid(value) {
@@ -2300,8 +2303,10 @@ async function requestClaudeText({ prompt, maxTokens, label }) {
   return message;
 }
 
-async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
-  const gapEndStr = gapEnd ? formatZonedClock(gapEnd) : "";
+async function generateNudgeCopy({ remainingMinutes, gapEnd, gapEndsAtEvent, tasks }) {
+  const context = gapEndsAtEvent
+    ? `Context: The user is currently free for about ${remainingMinutes} minutes (until around ${formatZonedClock(gapEnd)}, when their next calendar event starts).`
+    : "Context: The user has nothing on their calendar for the next few hours. Do not state an end time or a number of free minutes or hours.";
 
   const prompt = [
     "You are a friendly personal productivity assistant.",
@@ -2313,9 +2318,7 @@ async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
     "- Suggestive tone (no guilt, no commands).",
     "- Do not include any task IDs or internal metadata.",
     "",
-    `Context: The user is currently free for about ${remainingMinutes} minutes${
-      gapEndStr ? ` (until around ${gapEndStr})` : ""
-    }.`,
+    context,
     "Here are up to 3 tasks that fit this window (choose how to phrase them; you may mention more than one):",
     JSON.stringify(
       (Array.isArray(tasks) ? tasks : []).map((t) => ({
@@ -2703,15 +2706,16 @@ async function runNudgeTick() {
     message = await generateNudgeCopy({
       remainingMinutes: gap.remainingMinutes,
       gapEnd: gap.gapEnd,
+      gapEndsAtEvent: gap.gapEndsAtEvent,
       tasks: picked
     });
   } catch (err) {
     debug("Claude nudge copy failed; using fallback:", err instanceof Error ? err.message : err);
     const titles = picked.map((t) => t?.title).filter(Boolean);
-    const untilStr = gap.gapEnd ? formatZonedClock(gap.gapEnd) : "";
-    message = `You’ve got about ${gap.remainingMinutes} minutes free${
-      untilStr ? ` (until around ${untilStr})` : ""
-    }. If you’re up for it, you could work on ${titles.slice(0, 3).join(" / ")}.`;
+    const freeStr = gap.gapEndsAtEvent
+      ? `You’ve got about ${gap.remainingMinutes} minutes free (until around ${formatZonedClock(gap.gapEnd)})`
+      : "Your calendar is clear for the next few hours";
+    message = `${freeStr}. If you’re up for it, you could work on ${titles.slice(0, 3).join(" / ")}.`;
   }
 
   try {

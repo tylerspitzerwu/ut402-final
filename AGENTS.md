@@ -384,7 +384,9 @@ Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThat
 - Fetch every ID in `GOOGLE_CALENDAR_IDS` **in parallel**, following `nextPageToken`, then merge overlapping intervals.
 - Horizon: now + **6 hours** (`CALENDAR_HORIZON_HOURS`).
 
-The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any send/skip decision — it would only inflate the “you have about N minutes free” number on an empty calendar. If you raise it, cap what the nudge copy advertises.
+The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any send/skip decision — it could only change how much free time is reported.
+
+The end of the horizon is **not** a calendar event. `computeCurrentFreeGap` returns `gapEndsAtEvent`. The nudge copy (from Claude and from the fallback) only gives a free-until time and a minute count when a real busy block ends the gap. When the horizon is empty, it just says the calendar is clear for the next few hours. Otherwise a 4:30 PM nudge would say “free until 10:30 PM” only because 10:30 PM is where the 6-hour fetch window ends.
 
 Requests send a `fields` mask (`CALENDAR_FIELDS_MASK`) covering only what `parseGoogleEventBusyInterval` reads, with `maxResults=250` per page. Widening the parser means widening the mask, or the new field will silently arrive as `undefined`.
 
