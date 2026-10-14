@@ -44,7 +44,7 @@ Tyler (Telegram)  --getUpdates (long poll)-->  Node process (server.js)
 - **Entry:** `npm start` → `node server.js` (`package.json`).
 - **Module type:** CommonJS (`"type": "commonjs"`).
 - **Node:** pinned to `>=22` via `engines` in `package.json`, so Nixpacks does not silently pick a different major.
-- **Secrets:** `dotenv` loads `.env` locally. Production injects the same names as environment variables. `.env` is gitignored; never commit it or paste secret values into docs, commits, or chat.
+- **Secrets:** when run directly, `server.js` loads `.env` with Node's built-in `process.loadEnvFile()` (no `dotenv` dependency); a missing file is ignored and variables already in the environment win. Production injects the same names as environment variables. `.env` is gitignored; never commit it or paste secret values into docs, commits, or chat.
 
 On boot the process:
 
@@ -53,7 +53,7 @@ On boot the process:
 3. Loads allowlisted runtime settings from Supabase; a read error or invalid stored value fails startup rather than scheduling in the wrong timezone.
 4. Reclaims any reminder stuck in `sending` after a crash, returning it to `pending` (`reclaimStuckReminders`). A failure here is logged, not fatal.
 5. Registers five `node-cron` jobs in the active timezone, each wrapped in a single-flight guard.
-6. Installs `SIGTERM` / `SIGINT` handlers that stop cron and polling, let the message currently being handled finish, then exit 0.
+6. Installs `SIGTERM` / `SIGINT` handlers that stop cron and polling, let the message currently being handled and any running cron job finish, then exit 0.
 7. Starts the Telegram polling loop.
 
 **Every outbound request has a timeout** (`fetchWithTimeout` + `TIMEOUT_MS`): Anthropic 20s, Google 10s, Telegram 10s, and 55s for the long poll, which needs headroom over its own `timeout=50`. This matters more than it looks: handling is serial and single-threaded, so one hung request without a timeout stalls the entire bot for as long as it hangs. Any new call site must go through `fetchWithTimeout`.
@@ -71,11 +71,14 @@ When developing locally, **stop the Railway service** (or whatever is production
 | Path | Role |
 | --- | --- |
 | `server.js` | Entire application: Telegram, Claude, Calendar, cron, Supabase |
-| `package.json` / `package-lock.json` | Dependencies and `start` script |
+| `test/server.test.js` | `node:test` suite for the pure logic: DST and recurrence, reminder time resolution, free-gap math, reply assembly |
+| `package.json` / `package-lock.json` | Dependencies plus `start` and `test` scripts |
 | `.gitignore` | Ignores `.env`, `node_modules`, logs |
 | `AGENTS.md` | This file |
 
-There is no frontend, no test suite, no Dockerfile, no `railway.toml`. Railway Nixpacks detects Node from `package.json`.
+There is no frontend, no Dockerfile, no `railway.toml`. Railway Nixpacks detects Node from `package.json`.
+
+`server.js` only loads `.env`, installs signal handlers, and starts `main()` when run directly (`require.main === module`). Requiring it from a test builds config from whatever is in `process.env` and exports the pure helpers listed at the bottom of the file, with no network activity. `npm test` needs no credentials and is safe to run while production is polling.
 
 ## Environment variables
 
@@ -88,7 +91,7 @@ Application configuration names are read in `server.js`. Production (Railway **V
 | `TELEGRAM_BOT_TOKEN` | yes (startup) | Bot API token; long poll + `sendMessage` |
 | `TELEGRAM_CHAT_ID` | yes (startup) | Owner chat (`config.ownerChatId`): destination for nudges, morning, nightly digest, and the only chat allowed to change settings or use history |
 | `ANTHROPIC_API_KEY` | yes (startup) | Claude Messages API |
-| `CLAUDE_MODEL` | no | Default `claude-haiku-4-5-20251001` |
+| `CLAUDE_MODEL` | no | Default `claude-haiku-5-5` |
 | `SUPABASE_URL` | yes (startup) | Project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | yes (startup) | Server-side access; bypasses RLS. Treat as a secret. |
 | `GOOGLE_CLIENT_ID` | yes (startup) | OAuth client for Calendar |
@@ -226,7 +229,7 @@ There is deliberately **no** status CHECK constraint (unlike `tasks`); status va
 
 Candidate expansion is intentionally bounded by `RECURRENCE_SEARCH_LIMIT`: 400 days for daily/weekly rules, 60 months for monthly rules, and 12 years for yearly rules. A structurally valid interval with no match inside that horizon is refused with “That repeating schedule has no upcoming date.”
 
-Only `pending` rows may be mutated. Every write goes through `markReminder` / `updatePendingReminder`, which carry `.eq("status", "pending")` for the same reason task writes carry `.eq("status", "open")`: it is what stops a canceled or already-fired reminder from being revived. A batched cancel detects stale or invented ids by diffing the returned `id` set against the requested one.
+Only `pending` rows may be mutated by user operations. Every reminder write carries a status guard: single-row writes go through `markReminder(id, fromStatus, payload)` / `updatePendingReminder`, and the batched cancel and boot-time reclaim filter on status directly. The guard exists for the same reason task writes carry `.eq("status", "open")`: it is what stops a canceled or already-fired reminder from being revived. A batched cancel detects stale or invented ids by diffing the returned `id` set against the requested one.
 
 Retention: the 05:00 rollover deletes only **terminal** rows older than seven days (`REMINDER_RETENTION_MS`). A `pending` reminder can legitimately be weeks or months away and must never be swept up the way `clearAllNudgeSends` empties its whole table.
 
@@ -279,11 +282,11 @@ create index if not exists chat_messages_search_idx
 
 Interactive user/reply pairs share a `turn_id` and are inserted together only **after** the complete logical reply has been sent successfully to Telegram. This keeps the normal response path fast and prevents unsent assistant text from entering history. Store the original user text and exact user-visible reply, not raw Claude JSON, operations, tool calls, or debug payloads. A Telegram reply split into several 4096-character sends remains one assistant history row.
 
-Scheduled messages are stored as assistant-only turns with `kind` equal to `nudge`, `morning`, `digest`, or `reminder`, and are eligible for the recent context window. History writes, recent reads, and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history. A fired reminder for a non-owner chat is delivered, but not stored: `persistScheduledChatMessage` always writes as the owner, so it is only called for the owner chat.
+Scheduled messages are stored as assistant-only turns with `kind` equal to `nudge`, `morning`, `digest`, or `reminder`, and are eligible for the recent context window. History writes, recent reads, and searches are owner-only: chats other than `TELEGRAM_CHAT_ID` continue to work but are neither stored nor given access to conversation history. A fired reminder for a non-owner chat is delivered, but not stored: `persistScheduledChatMessage` always writes as the owner, so it is only called for the owner chat. The owner check lives with the callers that make the decision (`dispatchTelegramMessage`, `processUserQuery`, `sendReminderMessage`); the `chat_messages` helpers trust it.
 
 Every owner query reads up to `CONVERSATION_CONTEXT_MAX_MESSAGES` (20) messages no older than `CONVERSATION_CONTEXT_MAX_AGE_MS` (three hours), in parallel with the task and reminder snapshots. A read failure is logged and degrades to an empty context window rather than failing the query. Rows are reordered chronologically with `user` before `assistant` when timestamps tie, then leading assistant-only rows are dropped so the Anthropic message history begins with a user turn. Claude receives these rows as real `user` / `assistant` messages; static operating instructions use the request’s top-level `system` field, and the latest user message carries the current clock, snapshots, settings, and request.
 
-The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool exposes only `search` mode for an explicit prior-conversation topic or time-range lookup that the recent context does not answer, defaulting to the rolling seven days. There is **no result-count limit**. Node pages through PostgREST responses until every matching row has been loaded, then re-filters each row to the allowed interval so the other message in a matching turn cannot leak in if it falls outside the seven-day window. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
+The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns matching turns ordered by relevance and recency. Claude’s tool takes an optional `query`, `since`, and `before` for an explicit prior-conversation topic or time-range lookup that the recent context does not answer, defaulting to the rolling seven days. There is **no result-count limit**. Node pages through PostgREST responses until every matching row has been loaded, then re-filters each row to the allowed interval so the other message in a matching turn cannot leak in if it falls outside the seven-day window. Both Node and the RPC clamp access to seven days, and the 05:00 rollover physically deletes older rows.
 
 **Source-control gap:** the exact hosted SQL definition of `search_chat_history` is not present in this repository. The owner must export it from Supabase before this schema can be recreated from source; do not invent a replacement because ranking or boundary differences could change behavior.
 
@@ -296,6 +299,8 @@ Handling is **strictly serial**: the loop finishes one message (Claude call incl
 Every non-empty text message goes to `processUserQuery`. There are no `/list`, `/settings`, `/help`, `/start`, or `/clear` handlers: listing tasks, reading settings, help, Telegram’s automatic `/start`, and canceling every open task are ordinary Claude requests.
 
 Claude must finish through the structured `submit_operations` tool, whose input contains task, setting, and reminder operations plus a user-facing `message`. This process validates and applies the operations to Supabase, then sends the response. Task prose comes from Claude (or a fallback). Setting and reminder confirmations come from deterministic apply results so the bot cannot claim a failed write succeeded. Cancel-all is one `delete` per currently open task, batched by `applyTaskOperations`.
+
+**Errors.** Only a `UserFacingError` message is ever sent to Telegram; it marks text written for Tyler (validation messages, "I couldn’t understand the assistant response.", and so on). Any other failure — a Supabase read, an Anthropic 400, a timeout — is logged with its cause chain (`errorMessage`) and the user gets a generic "I couldn’t handle that request right now." Internal error text never reaches Telegram or chat history. Every Anthropic request goes through `postAnthropic`, which puts the HTTP status and response body in the thrown error, so a rejected request is visible in the logs rather than only as the generic reply.
 
 For the owner chat, the first `processUserQuery` Claude request sends the bounded recent conversation and exposes both `search_chat_history` and `submit_operations`. Tool choice is mandatory and parallel use is disabled: Claude either finishes immediately through `submit_operations` or performs one warranted search beyond the recent window. After a search, the second request preserves the same system prompt and conversation, exposes and forces only `submit_operations`, and cannot search again. Non-owner chats receive no conversation context and only the forced submit tool.
 
@@ -312,7 +317,7 @@ Recent conversation is supplied automatically so omitted objects, actions, and a
 
 `applyTaskOperations` batches **task** operations to keep the reply fast: **one** insert for all creates, **one** update per destination status (`.in("id", ids).eq("status", "open")`), and one update per distinct field payload for `update` ops. Updates run before status transitions so “rename X and mark it done” applies both. Since batched writes cannot use `.single()`, a stale or invented `targetId` is detected by diffing the returned `id` set against the requested one, not by a zero-row error. Keep the `.eq("status", "open")` guard on every task write: it is what stops Claude from reviving a completed, canceled, or pushed task. Setting and reminder writes go through their own apply paths.
 
-Unknown operation names are rejected rather than coerced into task creation. The structured submission schema requires an operations array and a friendly task `message` without IDs, urgency, or duration. Multi-task replies use `- ` bullets. For setting-only and reminder-only replies, Claude should leave `message` empty because Node writes the confirmation. If `message` is omitted entirely, that is tolerated rather than fatal: Node still writes setting and reminder lines, and task replies fall back to a deterministic summary. Only a missing operations array is unrecoverable.
+Unknown operation names are rejected rather than coerced into task creation. The operation enum in the tool schema and the prompt are both generated from `USER_OPERATIONS`, so they cannot drift. The structured submission schema requires an operations array and a friendly task `message` without IDs, urgency, or duration. Multi-task replies use `- ` bullets. For setting-only and reminder-only replies, Claude should leave `message` empty because Node writes the confirmation. If `message` is omitted entirely, that is tolerated rather than fatal: Node still writes setting and reminder lines, and task replies fall back to a deterministic summary. Only a missing operations array is unrecoverable.
 
 **Reminder parsing split.** Claude extracts intent only; Node owns every clock. Claude sends a local wall clock (`dueLocal` as `YYYY-MM-DDTHH:MM`), a relative `inMinutes`, or a `recurrence` object — never a UTC timestamp and never an offset it computed itself. The prompt is given the current **local** time and weekday so no conversion is needed. Node then resolves the wall clock through `resolveZonedWallClock`, applies the rules below, and writes the row.
 
@@ -342,13 +347,15 @@ Jobs are registered from the `SCHEDULED_JOBS` table and wrapped in `runExclusive
 
 If a job throws, it is logged; the process stays up.
 
+**`node-cron` stays on v3 deliberately.** v4's scheduler runs a repeated fall-back hour only once, so a sub-hourly schedule "can pause for up to the length of the DST shift" (v4 README). For the every-minute reminder tick that is up to an hour of late reminders once a year. Do not upgrade without moving the reminder tick to a UTC schedule. `runExclusive` is kept rather than v4's `noOverlap` because shutdown needs the in-flight promises.
+
 ## Reminders (fully deterministic)
 
 Implemented in `runReminderTick` / `fireOneOffReminder` / `fireRecurringReminder`. The tick selects `pending` rows with `next_due_at <= now()` and handles them serially. Delivery text is a plain `Reminder: <body>` and the body was finalized when the reminder was created, so **no Claude call happens at fire time**: no latency and no failure mode at 2pm.
 
 **Reminders deliberately bypass every nudge gate.** No 12:00–22:00 window, no daily cap, no cooldown, no calendar-busy suppression, and they do not count toward the nudge cap. The user asked for this message at this time; second-guessing it is exactly the friction this project avoids. Do not "unify" the reminder and nudge send paths.
 
-**Delivery is once-only, by claiming before sending.** A one-off is first moved `pending → sending` with the status guard; if the guard matches nothing (canceled in the meantime) the tick skips it. Only then is Telegram called. This is deliberately *not* the `nudges` table's send-then-record pattern, which accepts a double-send. A send failure increments `attempts` and returns the row to `pending`; at 3 attempts it becomes `failed`. A crash between claiming and sending leaves the row in `sending`, and `reclaimStuckReminders` returns it to `pending` at boot. If the crash happened after Telegram accepted the send, that reclaim can duplicate the message. That duplicate is the accepted cost of never silently dropping one.
+**Delivery is once-only, by claiming before sending.** A one-off is first moved `pending → sending` with the status guard; if the guard matches nothing (canceled in the meantime) the tick skips it. Only then is Telegram called. This is deliberately *not* the `nudges` table's send-then-record pattern, which accepts a double-send. A send failure increments `attempts` and returns the row to `pending`; at 3 attempts it becomes `failed`. A crash between claiming and sending leaves the row in `sending`, and `reclaimStuckReminders` returns it to `pending` at boot. If the crash happened after Telegram accepted the send, that reclaim can duplicate the message. That duplicate is the accepted cost of never silently dropping one. A graceful shutdown waits for a running tick, so a redeploy does not cause it; the `sending → sent` write is itself guarded on `sending`.
 
 **A series advances before it sends.** `fireRecurringReminder` writes the next occurrence (or `exhausted`) *first*, then delivers. A crash therefore costs one message instead of leaving a row that re-fires every minute. Because the row jumps straight to the next occurrence strictly after `now`, an outage spanning many missed occurrences delivers **one** message, not a burst — a three-day gap in a daily 8am reminder does not produce three sends. A late one-off, by contrast, always fires whenever the process comes back.
 
@@ -386,7 +393,7 @@ Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThat
 
 The horizon is deliberately short. Every gate compares against 30 minutes or less, so a longer window cannot change any send/skip decision — it could only change how much free time is reported.
 
-The end of the horizon is **not** a calendar event. `computeCurrentFreeGap` returns `gapEndsAtEvent`. The nudge copy (from Claude and from the fallback) only gives a free-until time and a minute count when a real busy block ends the gap. When the horizon is empty, it just says the calendar is clear for the next few hours. Otherwise a 4:30 PM nudge would say “free until 10:30 PM” only because 10:30 PM is where the 6-hour fetch window ends.
+The end of the horizon is **not** a calendar event. `computeCurrentFreeGap` returns `gapEndsAtEvent`. The nudge copy (from Claude and from the fallback) only gives a free-until time and a minute count when a real busy block ends the gap. When the horizon is empty, it just says the calendar is clear for the next few hours. Free-until times use the same `2:30 PM` wording as reminder confirmations (`formatZonedClock`). Otherwise a 4:30 PM nudge would say “free until 10:30 PM” only because 10:30 PM is where the 6-hour fetch window ends.
 
 Requests send a `fields` mask (`CALENDAR_FIELDS_MASK`) covering only what `parseGoogleEventBusyInterval` reads, with `maxResults=250` per page. Widening the parser means widening the mask, or the new field will silently arrive as `undefined`.
 
@@ -421,7 +428,7 @@ Anthropic: `POST https://api.anthropic.com/v1/messages`, header `anthropic-versi
 
 **Logs:** Railway deploy logs should show the five `Scheduled <job>:` registration lines with the active timezone followed by `Telegram long polling started.` Set `DEBUG=true` only when diagnosing nudge skips (`[nudge]`) or reminder skips (`[reminder]`).
 
-**Redeploys:** Railway sends `SIGTERM`, which the process handles by stopping the poll loop, finishing the message in hand, and exiting 0. Because the `getUpdates` offset is only advanced as updates are handled, an update interrupted by a deploy is redelivered rather than lost.
+**Redeploys:** Railway sends `SIGTERM`, which the process handles by stopping the poll loop and cron, finishing the message in hand and any running job (tracked in `inFlightJobs`), and exiting 0. Because the `getUpdates` offset is only advanced as updates are handled, an update interrupted by a deploy is redelivered rather than lost.
 
 **Local run (dev only):**
 
@@ -435,7 +442,7 @@ npm start
 
 - Do not log secrets, tokens, or full `.env`.
 - When changing nudge or reminder product rules, update **both** `server.js` and this file in the same change.
-- After behavior changes, verify: one poller, listing tasks via natural language still works, 05:00 rollover status transitions, nudge gates still deterministic, a one-off reminder fires exactly once, and a recurring reminder advances by wall clock.
+- Run `npm test` after any change. After behavior changes, also verify: one poller, listing tasks via natural language still works, 05:00 rollover status transitions, nudge gates still deterministic, a one-off reminder fires exactly once, and a recurring reminder advances by wall clock.
 - Treat network round trips as the thing to minimize; nothing here is CPU-bound. Batch Supabase writes, do not re-read rows the caller will not use, and never re-fetch a list just to return it up the stack.
 
 ## Out of scope (unless product explicitly changes)

@@ -1,5 +1,4 @@
 # secrets
-api-key.txt
 .env
 .env.*
 
@@ -16,5 +15,4 @@ pnpm-debug.log*
 # OS/editor
 .DS_Store
 .vscode/
-.filterrepo-venv/
 
