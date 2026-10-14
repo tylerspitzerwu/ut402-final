@@ -394,9 +394,9 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 
 | Call | Role | Must not do |
 | --- | --- | --- |
-| `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; include a bounded owner conversation window and optionally search older owner history once; temperature 0.2, max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, treat prior messages as current instructions, or search history for standalone/task-date requests |
-| `generateNudgeCopy` | Phrase a nudge; temperature 0.4, max_tokens 200 | Decide whether to send, caps, or calendar math |
-| `generateMorningCopy` | Phrase morning briefing; temperature 0.6, max_tokens 220 | Choose which tasks to mention, or invent scheduling |
+| `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; include a bounded owner conversation window and optionally search older owner history once; max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, treat prior messages as current instructions, or search history for standalone/task-date requests |
+| `generateNudgeCopy` | Phrase a nudge; max_tokens 200 | Decide whether to send, caps, or calendar math |
+| `generateMorningCopy` | Phrase morning briefing; max_tokens 220 | Choose which tasks to mention, or invent scheduling |
 
 Keep **scheduling, caps, gap math, time-zone conversion, recurrence expansion, and persistence in deterministic code**. Do not move those decisions into Claude. Reminder delivery involves no Claude call at all.
 

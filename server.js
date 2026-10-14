@@ -1923,7 +1923,6 @@ async function requestClaudeUserQuery({ system, messages, tools, toolChoice }) {
     const body = {
       model: config.claudeModel,
       max_tokens: 800,
-      temperature: 0.2,
       messages
     };
     if (system) body.system = system;
@@ -2270,7 +2269,7 @@ async function persistScheduledChatMessage(kind, content) {
   }
 }
 
-async function requestClaudeText({ prompt, maxTokens, temperature, label }) {
+async function requestClaudeText({ prompt, maxTokens, label }) {
   const response = await fetchWithTimeout(
     "https://api.anthropic.com/v1/messages",
     {
@@ -2283,7 +2282,6 @@ async function requestClaudeText({ prompt, maxTokens, temperature, label }) {
       body: JSON.stringify({
         model: config.claudeModel,
         max_tokens: maxTokens,
-        temperature,
         messages: [{ role: "user", content: prompt }]
       })
     },
@@ -2328,7 +2326,7 @@ async function generateNudgeCopy({ remainingMinutes, gapEnd, tasks }) {
     )
   ].join("\n");
 
-  return requestClaudeText({ prompt, maxTokens: 200, temperature: 0.4, label: "nudge copy" });
+  return requestClaudeText({ prompt, maxTokens: 200, label: "nudge copy" });
 }
 
 async function generateMorningCopy({ tasks }) {
@@ -2356,7 +2354,7 @@ async function generateMorningCopy({ tasks }) {
     JSON.stringify(titles)
   ].join("\n");
 
-  return requestClaudeText({ prompt, maxTokens: 220, temperature: 0.6, label: "morning copy" });
+  return requestClaudeText({ prompt, maxTokens: 220, label: "morning copy" });
 }
 
 function buildNightlyDigestText({ open, completed, canceled }) {
