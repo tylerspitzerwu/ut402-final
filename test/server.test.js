@@ -15,6 +15,7 @@ for (const name of [
 process.env.TELEGRAM_CHAT_ID = "1";
 process.env.SUPABASE_URL = "http://localhost:54321";
 process.env.GOOGLE_CALENDAR_IDS = "primary";
+process.env.LOCATION_AWARE_NUDGES = "false";
 
 const test = require("node:test");
 const assert = require("node:assert/strict");

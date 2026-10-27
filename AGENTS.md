@@ -24,6 +24,8 @@ A personal **Telegram task assistant** plus **scheduled messages** (nudges, morn
 
 It is a **single long-running Node.js process** (`server.js`). It does **not** serve HTTP. It does **not** expose a public URL. Incoming messages arrive by **Telegram long polling** (`getUpdates`). Outbound work is HTTPS to Telegram, Anthropic, Google OAuth/Calendar, and Supabase.
 
+Optional phone-location intake is a separate Supabase Edge Function, `location-update`, with its own HTTPS endpoint. It does not add an HTTP listener or another poller to the Node process. Deploying it and applying its SQL are separate setup steps. With `LOCATION_AWARE_NUDGES=true`, the nudge loop reads the latest position and short coordinate trail only after all existing eligibility checks, fetches Google Nearby Search candidates, and gives Claude the final location suitability decision. It defaults off until explicitly enabled in Railway. Movement and dwell time are evidence for Claude, not deterministic gates. Building footprints are deferred.
+
 The assistant persona in Claude prompts is named **Tod**.
 
 ## Runtime shape
@@ -56,7 +58,7 @@ On boot the process:
 6. Installs `SIGTERM` / `SIGINT` handlers that stop cron and polling, let the message currently being handled and any running cron job finish, then exit 0.
 7. Starts the Telegram polling loop.
 
-**Every outbound request has a timeout** (`fetchWithTimeout` + `TIMEOUT_MS`): Anthropic 20s, Google 10s, Telegram 10s, and 55s for the long poll, which needs headroom over its own `timeout=50`. This matters more than it looks: handling is serial and single-threaded, so one hung request without a timeout stalls the entire bot for as long as it hangs. Any new call site must go through `fetchWithTimeout`.
+**Every outbound request has a timeout** (`fetchWithTimeout` + `TIMEOUT_MS`): Anthropic 20s, Google 10s, Supabase 10s (through the SDK's configured fetch), Telegram 10s, and 55s for the long poll, which needs headroom over its own `timeout=50`. This matters more than it looks: handling is serial and single-threaded, so one hung request without a timeout stalls the entire bot for as long as it hangs. Any new call site must go through `fetchWithTimeout`.
 
 There is **no** Express/HTTP listener and **no** `PORT` bind. Do not add a web server unless a host requires a healthcheck. Do not use Trigger.dev or any external scheduler; scheduling stays in this process.
 
@@ -72,13 +74,21 @@ When developing locally, **stop the Railway service** (or whatever is production
 | --- | --- |
 | `server.js` | Entire application: Telegram, Claude, Calendar, cron, Supabase |
 | `test/server.test.js` | `node:test` suite for the pure logic: DST and recurrence, reminder time resolution, free-gap math, reply assembly |
+| `supabase/functions/location-update/index.mjs` | Standalone authenticated phone-location upload Edge Function |
+| `supabase/migrations/20261026000000_owner_location.sql` | Optional location table, access grants, and atomic timestamp-guarded write RPC |
+| `supabase/migrations/20261027000000_location_trail.sql` | Adds the latest-three-report trail and updates the existing RPC without changing phone uploads |
+| `supabase/config.toml` | Edge Function entrypoint and custom-token authentication configuration |
+| `supabase/LOCATION_SETUP.md` | Dashboard deployment and iPhone upload instructions |
+| `test/location-update.test.js` | Endpoint authentication, validation, response, and persistence-failure tests with mocked fetch |
+| `test/location-nudges.test.js` | Trail/distance/place/assessment validation and nudge workflow tests with mocked network calls |
+| `test/workflows.test.js` | Mocked regression checks for natural-language listing, rollover, and once-only / DST reminder delivery |
 | `package.json` / `package-lock.json` | Dependencies plus `start` and `test` scripts |
 | `.gitignore` | Ignores `.env`, `node_modules`, logs |
 | `AGENTS.md` | This file |
 
 There is no frontend, no Dockerfile, no `railway.toml`. Railway Nixpacks detects Node from `package.json`.
 
-`server.js` only loads `.env`, installs signal handlers, and starts `main()` when run directly (`require.main === module`). Requiring it from a test builds config from whatever is in `process.env` and exports the pure helpers listed at the bottom of the file, with no network activity. `npm test` needs no credentials and is safe to run while production is polling.
+`server.js` only loads `.env`, installs signal handlers, and starts `main()` when run directly (`require.main === module`). Requiring it from a test builds config from whatever is in `process.env` and exports the helpers listed at the bottom of the file, with no network activity on import. Nudge workflow tests call the exported tick with mocked network requests. `npm test` needs no credentials and is safe to run while production is polling.
 
 ## Environment variables
 
@@ -99,13 +109,15 @@ Application configuration names are read in `server.js`. Production (Railway **V
 | `GOOGLE_REFRESH_TOKEN` | yes (startup) | Offline token → access token |
 | `GOOGLE_CALENDAR_IDS` | yes (startup) | Comma-separated calendar IDs (e.g. `primary,user@gmail.com`) |
 | `DEBUG` | no | `true` enables extra nudge-tick and reminder-tick logs. Production should be `false`. |
+| `LOCATION_AWARE_NUDGES` | no | `true` enables the location assessment after existing nudge checks. Default `false`; only `true` / `false` are accepted (case-insensitive). Requires both location migrations, phone uploads, and Google Places API (New). |
+| `GOOGLE_MAPS_API_KEY` | when location mode is enabled | Server-only key restricted to **Places API (New)**. Missing/empty fails startup when `LOCATION_AWARE_NUDGES=true`; unused when disabled. Separate from Calendar OAuth and the phone upload token. |
 | `NODE_ENV` | no | Platform-only; set `production` on Railway. `server.js` does not read it. |
 
 Every incoming Telegram text message is handled as **natural language** for **any chat** that messages the bot. There are no slash-command shortcuts. **Scheduled** messages always go to `TELEGRAM_CHAT_ID`, not necessarily the last chatter.
 
 ## Data: Supabase
 
-Five tables. The service role key is used from this process only. The `CREATE TABLE` / index SQL below is the hosted schema; keep it in sync when the tables change.
+Five existing tables, plus optional `owner_location` after its migration is applied. The service role key is server-only: the Node process and the optional Supabase Edge Function use it; the phone never receives it. The `CREATE TABLE` / index SQL below describes the existing hosted schema; the location migration is the source for that optional table and RPC. Keep both in sync when the tables change.
 
 ### `tasks`
 
@@ -290,6 +302,18 @@ The `search_chat_history(p_chat_id, p_query, p_since, p_before)` RPC returns mat
 
 **Source-control gap:** the exact hosted SQL definition of `search_chat_history` is not present in this repository. The owner must export it from Supabase before this schema can be recreated from source; do not invent a replacement because ranking or boundary differences could change behavior.
 
+### Optional `owner_location` intake
+
+The initial table/grants/RPC SQL is in `supabase/migrations/20261026000000_owner_location.sql`. Apply it once for a new install, then apply `supabase/migrations/20261027000000_location_trail.sql`. Existing installs apply only the new trail migration. `owner_location` has `id` (boolean primary key constrained to true), `latitude` and `longitude` (range-checked double precision), `reported_at` (phone report timestamp), `received_at` (database timestamp), and `trail` (JSONB array constrained to at most three entries). Each trail entry contains the same latitude, longitude, reported_at, and received_at fields. It remains one singleton row, now with a short recent trail rather than a full location-history table. This does not promise deletion from infrastructure backups or platform logs.
+
+Row Level Security is enabled without public policies. `public`, `anon`, and `authenticated` have no table or RPC privileges. Only `service_role` can read/write it or invoke `record_owner_location(p_latitude, p_longitude, p_reported_at)`. That RPC uses an atomic upsert and updates only if `reported_at` is newer; delayed/duplicate uploads cannot overwrite a newer position or append trail entries. On an accepted upload it appends the report, discards entries more than 30 minutes before the new report, and retains only the newest three in chronological order. The new migration seeds the trail from any existing latest row. An outage longer than that span starts a new trail on the next upload. Old samples are pruned on subsequent uploads, not by an independent timer. The RPC signature and return boolean are unchanged, so the existing phone Shortcut and deployed Edge Function need no changes.
+
+The separate `location-update` Edge Function accepts only POST JSON containing numeric `latitude` / `longitude` and `reported_at` as ISO 8601 with seconds and an explicit timezone. Bodies are limited to 4096 bytes. Reports older than 24 hours or more than five minutes in the future are refused. `reported_at` is not proof of a fresh GPS fix; the nudge consumer separately checks freshness and tells Claude about uncertainty.
+
+The phone sends `Authorization: Bearer <token>`. Set `LOCATION_UPLOAD_TOKEN` to a random secret of at least 32 characters in **Supabase Edge Function secrets**, not Railway variables or frozen Node `config`. Supabase provides `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to the function. Platform JWT verification is disabled for this function because the phone token is not a Supabase login JWT; the handler verifies its dedicated token before parsing or persisting coordinates. Never put a service-role key on the phone.
+
+The function's sole outbound request goes through its own `fetchWithTimeout` with a ten-second timeout, including response-body consumption. Successful requests return `{"ok":true,"saved":true}` (or `saved:false` for an ignored duplicate/older report); failures use generic responses and never echo database errors, coordinates, or tokens. No Telegram or Claude calls happen on upload. Existing nudge gates, one-off reminders, and recurring reminders are unchanged; the optional nudge location veto is described below.
+
 ## Telegram interaction
 
 Polling: `getUpdates` with `timeout=50`, `limit=10`, `allowed_updates=["message"]`, offset advanced per `update_id`. Only `message.text` is handled (no photos, callbacks, etc.). On HTTP/API failure the loop waits 3s and retries.
@@ -367,7 +391,7 @@ Implemented in `runReminderTick` / `fireOneOffReminder` / `fireRecurringReminder
 
 **Timezone semantics differ by kind, on purpose.** A one-off reminder means an absolute instant and never moves when the timezone setting changes. A recurring reminder means a local wall clock, so `rescheduleRecurringReminders` recomputes every live series when the timezone changes and updates its `time_zone`. Recomputing from `now` also skips any occurrence that the zone change would make already due: moving Eastern → Pacific shifts an 8am series earlier in absolute time, and without that skip it would fire immediately. If that recompute fails, the timezone change still succeeds and `fireRecurringReminder` self-heals. A row whose `time_zone` no longer matches the active zone is rezoned and skipped for that tick instead of firing at the old wall clock.
 
-## Nudges (deterministic gates, Claude phrasing)
+## Nudges (deterministic gates, optional Claude location veto, Claude phrasing)
 
 Implemented in `runNudgeTick` / `canSendNudgeNow`. Product intent: suggest work only during real free time, about tasks that **fit the current gap**. Telegram copy stays suggestive prose; do not call these “nudges” in the user-facing text.
 
@@ -380,7 +404,21 @@ Implemented in `runNudgeTick` / `canSendNudgeNow`. Product intent: suggest work 
 5. Remaining free gap until next busy block (or the fetch horizon) is **≥ 30 minutes** (`MIN_FREE_GAP_MINUTES_FOR_NUDGE`).
 6. At least one **open** task with `duration` ≤ remaining gap minutes.
 
-Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThatFit`). Claude writes 1–3 suggestive sentences. On Claude failure, a template fallback is sent. After a successful Telegram send, insert a `nudges` row (even if persist fails, the user already got the message — next tick may double-send if insert failed).
+Then pick up to **3** eligible tasks, highest `urgency` first (`pickTopTasksThatFit`). With location mode disabled, Claude writes 1–3 suggestive sentences; on Claude failure, a template fallback is sent. With location mode enabled, the additional location veto below decides whether any copy may be sent. After a successful Telegram send, insert a `nudges` row (even if persist fails, the user already got the message — next tick may double-send if insert failed).
+
+**Optional location veto (`LOCATION_AWARE_NUDGES=true`):**
+
+- Only after gates 1–6 and task selection, read the singleton `owner_location` row including its trail in one query. No location read, Google Nearby Search, or location-specific Claude call happens on an ineligible tick. Uploading coordinates does not trigger a tick.
+- Require valid numeric coordinates and both phone `reported_at` and database `received_at` no older than **20 minutes** (`LOCATION_MAX_AGE_MS`), allowing at most five minutes of future clock skew. Missing, stale, invalid, or unreadable location skips the tick. The timestamps describe report freshness, not independently verified GPS-fix accuracy.
+- `buildLocationContext` validates historical reports, discards samples older than 40 minutes from now or inconsistent with the latest row, deduplicates timestamps, and sends at most three chronological reports including the current row. It computes observation span, maximum pairwise separation, net displacement, summed sampled path, and each segment's elapsed time, straight-line displacement, and interval-average displacement rate. Those rates are not current speed, and GPS noise or reused fixes can distort them. Out-and-back movement remains visible even when net displacement is zero. There is **no minimum dwell time, sample count, stationary-radius rule, or deterministic movement/uncertainty veto**: Tyler explicitly chose to let Claude weigh the evidence. A single fresh report is allowed.
+- `fetchNearbyPlaces` calls `POST https://places.googleapis.com/v1/places:searchNearby` once, after validating current location, through the ten-second Google timeout. Initial technical defaults are **150 meters**, **10 results**, ranked by **DISTANCE**, with no type filter. The field mask is exactly `places.id,places.displayName,places.location,places.primaryType,places.types` (Nearby Search Pro fields; no wildcard, reviews, or enterprise fields). These are distance-ranked POI candidates, not exhaustive buildings, footprints, or proof of occupancy. Invalid/out-of-radius/duplicate entries are discarded and the remaining candidates are sorted by computed straight-line distance. An empty successful response remains unknown-place evidence for Claude; it is not automatically rejected or interpreted as home. An API failure skips the tick without a model call or web-search fallback.
+- `generateLocationAwareNudge` uses the existing Claude model/key in **one** Messages API request, max_tokens **500**, with only the forced `submit_nudge_decision` client tool. It receives the raw coordinates/trail and measured summary, nearby place names/categories/coordinates/distances, current local clock, previously computed calendar gap, and selected tasks. Nearby data and task titles are untrusted context. Claude weighs ambiguity, recent movement, and task suitability; it must not claim a workout, driving, home ownership, or exact indoor position, or invent footprints/accuracy. Libraries/study spaces/cafes may suit study tasks, while a likely gym/appointment/travel context may be inappropriate. No web search or second model round-trip is used.
+- The submission contains `send`, descriptive `confidence` (`high` / `medium` / `low`), `reason` (`suitable` / `moving` / `unsuitable_place` / `uncertain`), `placeIds`, and `message`. `parseLocationNudgeResponse` requires a completed `tool_use` response with exactly one matching tool call, typed fields, known candidate IDs (an empty list is allowed), and `send:true` iff the reason is `suitable`. A send requires a nonempty message capped at 1000 characters. Claude's confidence does **not** independently veto its send decision. Malformed/truncated responses and timeouts skip; there is no model continuation or in-tick retry.
+- A passing assessment writes the friendly 1–3 sentence task suggestion in the **same request**. It may only veto an otherwise eligible nudge; it cannot override caps, calendar gates, scheduling, or mutate any state. The final message omits coordinates, addresses, venue names, sources, and tracking details. Google place results are used only in memory for that assessment; they are not cached or persisted. Raw assessment/place/trail payloads are neither logged nor stored in conversation history; failures use a generic log line with only the HTTP status when available. No Google Maps data is displayed in Telegram.
+- Before sending, recheck cap/cooldown/window, timezone, report freshness, and the remaining gap against the previously fetched calendar intervals. If the chosen tasks no longer fit, skip. This does not refetch calendars to detect newly added events during the assessment.
+- In location mode there is **no template fallback** on assessment failure, because that would bypass the veto. Skips do not count toward the three delivered nudges per day and do not start the send cooldown. The next ten-minute tick can reassess; there is no separate location retry cache or cooldown.
+- One-off and recurring timed reminders, morning copy, and nightly digest do not use location. No location data is added to ordinary task conversations.
+- Building footprints, road matching, phone activity sensors, Driving Focus, and other device-context signals are **not implemented**. Tyler chose a coordinate-only first version with Nearby Search and trails.
 
 **Calendar “busy” rules** (`parseGoogleEventBusyInterval`):
 
@@ -399,15 +437,16 @@ Requests send a `fields` mask (`CALENDAR_FIELDS_MASK`) covering only what `parse
 
 OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Events list API. The access token is **cached** in memory until 5 minutes before its `expires_in`, and dropped on a `401` so the next tick re-fetches.
 
-## Claude usage (three call sites)
+## Claude usage
 
 | Call | Role | Must not do |
 | --- | --- | --- |
 | `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; include a bounded owner conversation window and optionally search older owner history once; max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, treat prior messages as current instructions, or search history for standalone/task-date requests |
 | `generateNudgeCopy` | Phrase a nudge; max_tokens 200 | Decide whether to send, caps, or calendar math |
+| `generateLocationAwareNudge` | Optional location suitability decision from Nearby Search candidates and recent coordinate trail, plus nudge wording in one Messages request; max_tokens 500 | Override deterministic gates, equate nearest POI with occupancy, invent activity/home/footprints, mutate any state, expose location details in Telegram copy |
 | `generateMorningCopy` | Phrase morning briefing; max_tokens 220 | Choose which tasks to mention, or invent scheduling |
 
-Keep **scheduling, caps, gap math, time-zone conversion, recurrence expansion, and persistence in deterministic code**. Do not move those decisions into Claude. Reminder delivery involves no Claude call at all.
+Keep **scheduling, caps, gap math, time-zone conversion, recurrence expansion, and persistence in deterministic code**. Do not move those decisions into Claude. The explicitly enabled location veto is the sole exception allowing Claude to suppress an otherwise eligible nudge. Reminder delivery involves no Claude call at all.
 
 Anthropic: `POST https://api.anthropic.com/v1/messages`, header `anthropic-version: 2023-06-01`, `x-api-key`.
 

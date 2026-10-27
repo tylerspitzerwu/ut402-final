@@ -1,0 +1,4 @@
+[functions.location-update]
+# The function validates its own dedicated phone-upload Bearer token.
+verify_jwt = false
+entrypoint = "./functions/location-update/index.mjs"
