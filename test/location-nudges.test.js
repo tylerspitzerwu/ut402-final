@@ -18,6 +18,7 @@ const PLACES = [{ id: "library-1", displayName: { text: "Library" },
   location: { latitude: 42.2801, longitude: -83.74 }, primaryType: "library", types: ["library"] }];
 const TASK = { id: "task-1", title: "Read a chapter", urgency: 5, duration: 30 };
 const DECISION = { send: true, confidence: "high", reason: "suitable",
+  explanation: "Limited movement and a study-friendly setting suit the selected work.",
   message: "If you’re up for it, you could read a chapter.", placeIds: ["library-1"] };
 
 function assessment(decision = DECISION) {
@@ -29,6 +30,10 @@ function assessment(decision = DECISION) {
 function fixture(t, options = {}) {
   t.mock.timers.enable({ apis: ["Date"], now: NOW });
   const calls = [];
+  calls.decisionLogs = [];
+  t.mock.method(console, "log", (prefix, entry) => {
+    if (prefix === "[nudge-decision]") calls.decisionLogs.push(JSON.parse(entry));
+  });
   t.mock.method(globalThis, "fetch", async (input, init = {}) => {
     const url = new URL(input);
     const method = init.method || "GET";
@@ -55,7 +60,10 @@ function fixture(t, options = {}) {
       if (options.anthropicError) throw new Error("Do not expose request details");
       return Response.json(options.response || assessment());
     }
-    if (url.hostname === "api.telegram.org") return Response.json({ ok: true, result: {} });
+    if (url.hostname === "api.telegram.org") {
+      if (options.telegramError) throw new Error("private telegram request details");
+      return Response.json({ ok: true, result: {} });
+    }
     if (url.pathname === "/rest/v1/chat_messages") return Response.json(null);
     throw new Error(`Unexpected request: ${url.pathname}`);
   });
@@ -144,7 +152,8 @@ test("Nearby Search normalization validates, bounds, deduplicates, and distance-
 
 test("location decisions require one complete submission with only known place references", () => {
   assert.deepEqual(parseLocationNudgeResponse(assessment(), PLACES), {
-    send: true, reason: "suitable", message: DECISION.message
+    send: true, reason: "suitable", message: DECISION.message,
+    confidence: DECISION.confidence, explanation: DECISION.explanation
   });
   for (const response of [
     { ...assessment(), stop_reason: "max_tokens" },
@@ -154,6 +163,9 @@ test("location decisions require one complete submission with only known place r
     assessment({ ...DECISION, placeIds: ["invented-place"] }),
     assessment({ ...DECISION, send: true, reason: "moving" }),
     assessment({ ...DECISION, message: "" }),
+    assessment({ ...DECISION, explanation: undefined }),
+    assessment({ ...DECISION, explanation: "  " }),
+    assessment({ ...DECISION, explanation: "x".repeat(301) }),
     { stop_reason: "tool_use", content: [...assessment().content, ...assessment().content] }
   ]) assert.throws(() => parseLocationNudgeResponse(response, PLACES));
   // The user chose Claude's judgment over a hard confidence cutoff.
@@ -179,6 +191,9 @@ test("nudge gates prevent every location read and Claude call when ineligible", 
     assert.equal(count(calls, "/v1/places:searchNearby"), 0);
     assert.equal(count(calls, "/v1/messages"), 0);
     assert.equal(count(calls, "/bottest/sendMessage"), 0);
+    assert.equal(calls.decisionLogs.length, 1);
+    assert.equal(calls.decisionLogs[0].event, "skipped");
+    assert.equal(typeof calls.decisionLogs[0].reason, "string");
   });
 });
 
@@ -191,18 +206,25 @@ test("missing or stale phone reports cause no Claude or Telegram calls", async (
       assert.equal(count(calls, "/v1/places:searchNearby"), 0);
       assert.equal(count(calls, "/v1/messages"), 0);
       assert.equal(count(calls, "/bottest/sendMessage"), 0);
+      assert.equal(calls.decisionLogs[0].reason, "location_unavailable_or_stale");
     });
   }
 });
 
 test("gym rejection skips Telegram, send-log, and history writes", async (t) => {
   const calls = fixture(t, { response: assessment({ ...DECISION, send: false,
-    reason: "unsuitable_place", message: "" }) });
+    reason: "unsuitable_place", message: "",
+    explanation: "The apparent setting may make a work suggestion disruptive." }) });
   await runNudgeTick();
   assert.equal(count(calls, "/v1/messages"), 1);
   assert.equal(count(calls, "/bottest/sendMessage"), 0);
   assert.equal(count(calls, "/rest/v1/nudges", "POST"), 0);
   assert.equal(count(calls, "/rest/v1/chat_messages"), 0);
+  assert.deepEqual(calls.decisionLogs.map(({ event, send, reason, confidence, explanation }) =>
+    ({ event, send, reason, confidence, explanation })), [{
+    event: "assessment", send: false, reason: "unsuitable_place", confidence: "high",
+    explanation: "The apparent setting may make a work suggestion disruptive."
+  }]);
 });
 
 test("Claude still weighs recent travel instead of a hard movement/dwell gate", async (t) => {
@@ -231,6 +253,8 @@ test("a failed place lookup skips Claude and Telegram instead of guessing or sea
   assert.equal(count(calls, "/v1/messages"), 0);
   assert.equal(count(calls, "/bottest/sendMessage"), 0);
   assert.deepEqual(logs, ["Nudge location assessment failed (HTTP 403); skipping this tick."]);
+  assert.equal(calls.decisionLogs[0].reason, "location_assessment_failed");
+  assert.equal(calls.decisionLogs[0].http_status, 403);
 });
 
 test("approved location uses one Claude request, then sends and records exact user-visible text", async (t) => {
@@ -254,6 +278,21 @@ test("approved location uses one Claude request, then sends and records exact us
   assert.equal(count(calls, "/rest/v1/nudges", "POST"), 1);
   assert.equal(calls.find((call) => call.path === "/rest/v1/chat_messages").body.content, DECISION.message);
   assert.ok(calls.every((call) => call.signal instanceof AbortSignal));
+  assert.deepEqual(calls.decisionLogs.map((entry) => entry.event), ["assessment", "sent"]);
+  const logged = calls.decisionLogs[0];
+  assert.equal(logged.explanation, DECISION.explanation);
+  assert.equal(logged.confidence, "high");
+  assert.equal(logged.send, true);
+  assert.equal(logged.at, new Date(NOW).toISOString());
+  assert.equal(logged.time_zone, "America/Los_Angeles");
+  assert.equal(logged.tick_id, calls.decisionLogs[1].tick_id);
+  assert.equal(logged.task_count, 1);
+  assert.equal(logged.report_count, 1);
+  assert.equal(logged.nearby_place_count, 1);
+  for (const privateValue of [String(LOCATION.latitude), String(LOCATION.longitude),
+    PLACES[0].id, PLACES[0].displayName.text, TASK.title, DECISION.message, "test-maps-key"]) {
+    assert.ok(!JSON.stringify(calls.decisionLogs).includes(privateValue));
+  }
 });
 
 test("assessment failures never fall back to an ungated suggestion", async (t) => {
@@ -262,12 +301,35 @@ test("assessment failures never fall back to an ungated suggestion", async (t) =
   await runNudgeTick();
   assert.equal(count(calls, "/v1/messages"), 1);
   assert.equal(count(calls, "/bottest/sendMessage"), 0);
+  assert.equal(calls.decisionLogs[0].reason, "location_assessment_failed");
+  assert.ok(!JSON.stringify(calls.decisionLogs).includes("Do not expose request details"));
 });
 
 test("eligibility is checked again if time passes during the search", async (t) => {
   const calls = fixture(t, { onAssessment: () => t.mock.timers.tick(21 * 60 * 1000) });
   await runNudgeTick();
   assert.equal(count(calls, "/v1/messages"), 1);
+  assert.equal(count(calls, "/bottest/sendMessage"), 0);
+  assert.deepEqual(calls.decisionLogs.map((entry) => entry.event), ["assessment", "skipped"]);
+  assert.equal(calls.decisionLogs[1].reason, "eligibility_changed_after_assessment");
+});
+
+test("a model approval is distinguished from failed Telegram delivery", async (t) => {
+  const calls = fixture(t, { telegramError: true });
+  await runNudgeTick();
+  assert.deepEqual(calls.decisionLogs.map((entry) => entry.event), ["assessment", "delivery_failed"]);
+  assert.equal(calls.decisionLogs[1].reason, "telegram_send_failed");
+  assert.equal(count(calls, "/rest/v1/nudges", "POST"), 0);
+  assert.ok(!JSON.stringify(calls.decisionLogs).includes("private telegram request details"));
+});
+
+test("malformed decisions are never included in logs", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const calls = fixture(t, { response: assessment({ ...DECISION, explanation: "private-raw-content",
+    placeIds: ["invented-place"] }) });
+  await runNudgeTick();
+  assert.equal(calls.decisionLogs[0].reason, "location_assessment_failed");
+  assert.ok(!JSON.stringify(calls.decisionLogs).includes("private-raw-content"));
   assert.equal(count(calls, "/bottest/sendMessage"), 0);
 });
 
@@ -281,4 +343,5 @@ test("disabled location mode preserves the ordinary nudge copy and fallback", as
   assert.equal(count(calls, "/v1/places:searchNearby"), 0);
   assert.equal(calls.find((call) => call.path === "/v1/messages").body.tools, undefined);
   assert.equal(count(calls, "/bottest/sendMessage"), 1);
+  assert.deepEqual(calls.decisionLogs, []);
 });

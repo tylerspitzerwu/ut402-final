@@ -2392,10 +2392,12 @@ const NUDGE_DECISION_TOOL = Object.freeze({
       send: { type: "boolean" },
       confidence: { type: "string", enum: ["high", "medium", "low"] },
       reason: { type: "string", enum: ["suitable", "moving", "unsuitable_place", "uncertain"] },
+      explanation: { type: "string", minLength: 1, maxLength: 300,
+        description: "One short sentence summarizing the decision for the owner's logs, without location details or task titles." },
       placeIds: { type: "array", items: { type: "string" }, description: "Only IDs from the supplied nearby_places that inform this decision; may be empty." },
       message: { type: "string", description: "Plain-text task suggestion when sending; empty when skipping. Never include location details." }
     },
-    required: ["send", "confidence", "reason", "placeIds", "message"],
+    required: ["send", "confidence", "reason", "explanation", "placeIds", "message"],
     additionalProperties: false
   }
 });
@@ -2407,6 +2409,7 @@ function parseLocationNudgeResponse(data, places) {
   if (!result || typeof result.send !== "boolean" ||
       !["high", "medium", "low"].includes(result.confidence) ||
       !["suitable", "moving", "unsuitable_place", "uncertain"].includes(result.reason) ||
+      typeof result.explanation !== "string" || !result.explanation.trim() || result.explanation.length > 300 ||
       typeof result.message !== "string" || !Array.isArray(result.placeIds) ||
       result.placeIds.some((id) => !knownIds.has(id)) ||
       result.send !== (result.reason === "suitable")) {
@@ -2414,10 +2417,12 @@ function parseLocationNudgeResponse(data, places) {
   }
   // Movement, short dwell time, uncertainty, and the model's confidence are
   // evidence for Claude to weigh, not additional deterministic send gates.
-  if (!result.send) return { send: false, reason: result.reason };
+  const decision = { send: result.send, reason: result.reason, confidence: result.confidence,
+    explanation: result.explanation.trim().replace(/\s+/g, " ") };
+  if (!result.send) return decision;
   const message = result.message.trim();
   if (!message || message.length > 1000) throw new Error("Invalid location suggestion.");
-  return { send: true, reason: result.reason, message };
+  return { ...decision, message };
 }
 
 async function generateLocationAwareNudge({ locationContext, places, remainingMinutes, gapEnd, gapEndsAtEvent, tasks }) {
@@ -2425,7 +2430,7 @@ async function generateLocationAwareNudge({ locationContext, places, remainingMi
     ? `Free for about ${remainingMinutes} minutes, until ${formatZonedClock(gapEnd, getActiveTimeZone())}.`
     : "Calendar clear for the next few hours. Do not state an end time or a number of free minutes or hours.";
   const data = await postAnthropic({
-    max_tokens: 500,
+    max_tokens: 650,
     system: [
       "You are Tod, Tyler's personal productivity assistant. All deterministic nudge eligibility checks have passed.",
       "Your only scheduling role is a location veto: weigh the recent coordinate trail, nearby place candidates, and tasks to decide whether a suggestion makes sense.",
@@ -2441,6 +2446,7 @@ async function generateLocationAwareNudge({ locationContext, places, remainingMi
       `Finish by calling ${NUDGE_DECISION_TOOL_NAME} exactly once. Use send:true with reason:suitable, or send:false with moving, unsuitable_place, or uncertain.`,
       "Use only supplied place IDs when citing candidates in the tool input; an empty placeIds list is allowed. Confidence is descriptive and does not override your send decision.",
       "Use an empty message when skipping.",
+      "Include explanation: one brief sentence (at most 300 characters) summarizing the main basis for your decision for Tyler's logs, not step-by-step reasoning. Use general terms such as limited movement, study-friendly setting, or ambiguous surroundings. Never include coordinates, addresses, venue names, place IDs, task titles, or quoted input in the explanation.",
       "When sending, write a friendly, suggestive 1-3 sentence plain-text task suggestion. Mention only the supplied tasks.",
       "Never include coordinates, addresses, venue names, source links, task IDs, urgency, tracking details, or the location assessment in the message.",
       "Never create or modify tasks, reminders, settings, or any other state. Do not output user-facing text outside the submission tool."
@@ -2751,6 +2757,13 @@ async function rescheduleRecurringReminders(timeZone) {
 
 async function runNudgeTick(now = new Date()) {
   const timeZone = getActiveTimeZone();
+  const tickId = randomUUID();
+  // Allowlisted summaries only: never pass raw location, places, model responses, or errors.
+  const logDecision = (event, details = {}) => {
+    if (config.locationAwareNudges) console.log("[nudge-decision]", JSON.stringify({
+      tick_id: tickId, at: new Date().toISOString(), time_zone: timeZone, event, ...details
+    }));
+  };
   const debug = (...args) => {
     if (config.debug) console.log("[nudge]", ...args);
   };
@@ -2760,10 +2773,12 @@ async function runNudgeTick(now = new Date()) {
     gates = await canSendNudgeNow(now);
   } catch (err) {
     debug("Gate check failed:", errorMessage(err));
+    logDecision("skipped", { reason: "gate_check_failed" });
     return;
   }
   if (!gates.ok) {
     debug("Not eligible:", gates.reason);
+    logDecision("skipped", { reason: gates.reason });
     return;
   }
 
@@ -2774,16 +2789,19 @@ async function runNudgeTick(now = new Date()) {
     busyIntervals = await fetchCalendarBusyIntervals({ timeMin: now, timeMax: horizonEnd });
   } catch (err) {
     debug("Calendar fetch failed:", errorMessage(err));
+    logDecision("skipped", { reason: "calendar_fetch_failed" });
     return;
   }
 
   const gap = computeCurrentFreeGap({ now, busyIntervals, horizonEnd });
   if (!gap.freeNow) {
     debug("Busy until:", gap.blockingEventEnd?.toISOString());
+    logDecision("skipped", { reason: "calendar_busy" });
     return;
   }
   if (gap.remainingMinutes < MIN_FREE_GAP_MINUTES_FOR_NUDGE) {
     debug("Gap too short for nudge:", gap.remainingMinutes, "<", MIN_FREE_GAP_MINUTES_FOR_NUDGE);
+    logDecision("skipped", { reason: "gap_too_short" });
     return;
   }
 
@@ -2792,12 +2810,14 @@ async function runNudgeTick(now = new Date()) {
     tasks = await listTasks({ statuses: ["open"] });
   } catch (err) {
     debug("List tasks failed:", errorMessage(err));
+    logDecision("skipped", { reason: "task_read_failed" });
     return;
   }
 
   const picked = pickTopTasksThatFit({ tasks, remainingMinutes: gap.remainingMinutes });
   if (!picked.length) {
     debug("No tasks fit remaining gap:", gap.remainingMinutes);
+    logDecision("skipped", { reason: "no_fitting_tasks" });
     return;
   }
 
@@ -2808,6 +2828,7 @@ async function runNudgeTick(now = new Date()) {
       const locationContext = buildLocationContext(await readOwnerLocation(), new Date());
       if (!locationContext) {
         debug("Location missing, invalid, or older than 20 minutes; skipping.");
+        logDecision("skipped", { reason: "location_unavailable_or_stale" });
         return;
       }
       const places = await fetchNearbyPlaces(locationContext.location);
@@ -2818,6 +2839,12 @@ async function runNudgeTick(now = new Date()) {
         gapEnd: gap.gapEnd,
         gapEndsAtEvent: gap.gapEndsAtEvent,
         tasks: picked
+      });
+      logDecision("assessment", {
+        send: decision.send, reason: decision.reason, confidence: decision.confidence,
+        explanation: decision.explanation, task_count: picked.length,
+        free_minutes: gap.remainingMinutes, report_count: locationContext.trail.report_count,
+        nearby_place_count: places.length
       });
       if (!decision.send) {
         debug("Location assessment skipped:", decision.reason);
@@ -2832,6 +2859,7 @@ async function runNudgeTick(now = new Date()) {
           picked.some((task) => task.duration > currentGap.remainingMinutes) ||
           !normalizeOwnerLocation(locationContext.location, sendTime)) {
         debug("Eligibility changed during location assessment; skipping.");
+        logDecision("skipped", { reason: "eligibility_changed_after_assessment" });
         return;
       }
       message = decision.message;
@@ -2840,6 +2868,8 @@ async function runNudgeTick(now = new Date()) {
       // search queries/results, or the location-specific assistant response.
       const status = Number.isInteger(err?.status) ? ` (HTTP ${err.status})` : "";
       console.error(`Nudge location assessment failed${status}; skipping this tick.`);
+      logDecision("skipped", { reason: "location_assessment_failed",
+        ...(Number.isInteger(err?.status) ? { http_status: err.status } : {}) });
       return;
     }
   } else {
@@ -2864,13 +2894,16 @@ async function runNudgeTick(now = new Date()) {
     await telegramSendMessage(config.ownerChatId, message);
   } catch (err) {
     debug("Telegram send failed:", errorMessage(err));
+    logDecision("delivery_failed", { reason: "telegram_send_failed" });
     return;
   }
+  logDecision("sent");
 
   try {
     await insertNudgeSend(picked.map((t) => t.id));
   } catch (err) {
     debug("Nudge persist failed:", errorMessage(err));
+    logDecision("send_log_failed", { reason: "nudge_send_record_failed" });
   }
 
   await persistScheduledChatMessage("nudge", message);

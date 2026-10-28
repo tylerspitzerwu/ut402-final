@@ -157,6 +157,39 @@ Only phone reports are persisted. Nearby place names/categories/coordinates and
 the raw assessment remain in memory for the current tick. No building footprints,
 Driving Focus, road matching, or phone motion sensors are included in this version.
 
+### View the decisions
+
+Open your **Railway project → bot service → latest deployment → logs** and search
+for **`[nudge-decision]`**. These structured JSON entries are always enabled when
+`LOCATION_AWARE_NUDGES=true`, including with `DEBUG=false`.
+
+- `skipped`: a fixed reason explains why the tick stopped, such as
+  `outside_send_window`, `cooldown`, `calendar_busy`, or
+  `location_unavailable_or_stale`. These can occur before any Claude request.
+- `assessment`: Claude's send/skip choice, confidence, reason, and a short
+  explanation of its main basis. Counts of selected tasks, reports, nearby
+  candidates, and available minutes give context. This is a brief decision
+  summary, not step-by-step reasoning.
+- `sent`: Telegram accepted the suggestion. An approved assessment can instead
+  be followed by `skipped` (`eligibility_changed_after_assessment`) or
+  `delivery_failed`. `send_log_failed` means delivery succeeded but recording it
+  for the daily cap failed.
+
+Entries from the same tick share `tick_id`; `at` is UTC and `time_zone` identifies
+the bot's active timezone. For example, an assessment might include:
+
+```json
+{"event":"assessment","send":false,"reason":"uncertain","confidence":"medium","explanation":"Ambiguous surroundings make a work suggestion poorly timed."}
+```
+
+The logger does not copy raw coordinates, place results, task titles, suggestion
+text, or upstream errors. Claude is instructed to omit identifying details from
+the explanation; its type and length are validated, but semantic redaction is
+not enforced. Logs remain subject to Railway's retention. No database migration,
+additional environment setting, extra model request, or Telegram notification is
+needed for logging. Entries begin after deploying this code; previous decisions
+cannot be reconstructed.
+
 Explicit timed reminders still fire as requested. Morning and nightly messages
 also keep their existing behavior. To restore ordinary nudges, set
 `LOCATION_AWARE_NUDGES=false` and restart/redeploy.
