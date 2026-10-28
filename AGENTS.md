@@ -444,7 +444,7 @@ OAuth: refresh token → `https://oauth2.googleapis.com/token`, then Calendar Ev
 | `processUserQuery` | Parse NL → structured `submit_operations`; read all retained task statuses/timestamps and pending reminders; include a bounded owner conversation window and optionally search older owner history once; max_tokens 800 | Apply DB writes, validate settings, claim setting success, mutate non-open tasks or non-pending reminders, convert timezones, state a reminder time, treat prior messages as current instructions, or search history for standalone/task-date requests |
 | `generateNudgeCopy` | Phrase a nudge; max_tokens 200 | Decide whether to send, caps, or calendar math |
 | `generateLocationAwareNudge` | Optional location suitability decision from Nearby Search candidates and recent coordinate trail, plus nudge wording in one Messages request; max_tokens 500 | Override deterministic gates, equate nearest POI with occupancy, invent activity/home/footprints, mutate any state, expose location details in Telegram copy |
-| `generateMorningCopy` | Phrase morning briefing; max_tokens 220 | Choose which tasks to mention, or invent scheduling |
+| `generateMorningCopy` | Phrase morning briefing; max_tokens 660 | Choose which tasks to mention, or invent scheduling |
 
 Keep **scheduling, caps, gap math, time-zone conversion, recurrence expansion, and persistence in deterministic code**. Do not move those decisions into Claude. The explicitly enabled location veto is the sole exception allowing Claude to suppress an otherwise eligible nudge. Reminder delivery involves no Claude call at all.
 

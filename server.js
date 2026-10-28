@@ -2482,7 +2482,7 @@ async function generateMorningCopy({ tasks }) {
     JSON.stringify(titles)
   ].join("\n");
 
-  return requestClaudeText({ prompt, maxTokens: 220, label: "morning copy" });
+  return requestClaudeText({ prompt, maxTokens: 660, label: "morning copy" });
 }
 
 function buildNightlyDigestText({ open, completed, canceled }) {
